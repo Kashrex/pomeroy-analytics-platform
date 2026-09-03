@@ -264,7 +264,9 @@ def read_events(session: Session, stage: str):
     session.sql(
         f"""
         CREATE TEMPORARY TABLE IF NOT EXISTS {staging_table} (
-            PAYLOAD VARIANT
+            PAYLOAD VARIANT,
+            SOURCE_FILE STRING,
+            SOURCE_ROW_NUMBER NUMBER
         )
         """
     ).collect()
@@ -274,8 +276,14 @@ def read_events(session: Session, stage: str):
 
     copy_results = session.sql(
         f"""
-        COPY INTO {staging_table} (PAYLOAD)
-        FROM (SELECT $1 FROM @{stage}/events/)
+        COPY INTO {staging_table} (PAYLOAD, SOURCE_FILE, SOURCE_ROW_NUMBER)
+        FROM (
+            SELECT
+                $1,
+                METADATA$FILENAME,
+                METADATA$FILE_ROW_NUMBER
+            FROM @{stage}/events/
+        )
         FILE_FORMAT = (FORMAT_NAME = {json_format})
         ON_ERROR = 'CONTINUE'
         PURGE = FALSE
@@ -313,7 +321,11 @@ def normalize_events(session: Session, raw_df):
       technician.id, location.store_id, location.region,
       labor.minutes
     """
-    df = raw_df.select(col("PAYLOAD"))
+    df = raw_df.select(
+        col("PAYLOAD"),
+        col("SOURCE_FILE"),
+        col("SOURCE_ROW_NUMBER"),
+    )
 
     normalized = df.select(
         col("PAYLOAD")["event_id"].cast("string").alias("EVENT_ID"),
@@ -341,6 +353,8 @@ def normalize_events(session: Session, raw_df):
         .alias("LABOR_MINUTES"),
         col("PAYLOAD")["source"].cast("string").alias("SOURCE_SYSTEM"),
         col("PAYLOAD").cast("variant").alias("RAW_PAYLOAD"),
+        col("SOURCE_FILE"),
+        col("SOURCE_ROW_NUMBER"),
     )
 
     normalized = normalized.select(
@@ -423,8 +437,8 @@ def load_events(session: Session, events_df, run_id: str) -> None:
             REGION = source.REGION,
             LABOR_MINUTES = source.LABOR_MINUTES,
             SOURCE_SYSTEM = source.SOURCE_SYSTEM,
-            SOURCE_FILE = 'snowpark_stage',
-            SOURCE_ROW_NUMBER = NULL,
+            SOURCE_FILE = source.SOURCE_FILE,
+            SOURCE_ROW_NUMBER = source.SOURCE_ROW_NUMBER,
             PAYLOAD_HASH = source.PAYLOAD_HASH,
             RAW_PAYLOAD = source.RAW_PAYLOAD,
             LAST_SEEN_AT = CURRENT_TIMESTAMP()
