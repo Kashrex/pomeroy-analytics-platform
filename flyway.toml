@@ -1,5 +1,7 @@
 [flyway]
 locations = ["filesystem:sql/flyway"]
-defaultSchema = "WORK"
-schemas = ["WORK"]
 cleanDisabled = true
+
+[environments.default]
+# The first managed schema is also Flyway's default/history-table schema.
+schemas = ["WORK"]
