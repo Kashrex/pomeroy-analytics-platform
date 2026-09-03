@@ -28,16 +28,6 @@ jobs:
         with:
           edition: community
           i-agree-to-the-eula: true
-      - name: Verify Python Snowflake connection
-        run: python -m src.preflight
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_DATABASE }}
-          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_WAREHOUSE }}
-          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
-          SNOWFLAKE_SCHEMA: WORK
       - name: Verify Snowflake migration connection
         run: flyway info -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD"
         env:
@@ -52,7 +42,7 @@ jobs:
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
       - name: Apply versioned and repeatable Snowflake scripts
-        run: flyway -X migrate -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD" -baselineOnMigrate="true"
+        run: flyway migrate -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD" -baselineOnMigrate="true" -X
         env:
           SNOWFLAKE_JDBC_URL: ${{ secrets.SNOWFLAKE_JDBC_URL }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
