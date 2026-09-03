@@ -46,13 +46,13 @@ jobs:
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
       - name: Repair a failed Flyway history entry when explicitly requested
         if: ${{ inputs.repair_failed_migration }}
-        run: flyway repair -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD"
+        run: flyway repair -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD" -baselineOnMigrate="true"
         env:
           SNOWFLAKE_JDBC_URL: ${{ secrets.SNOWFLAKE_JDBC_URL }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
       - name: Apply versioned and repeatable Snowflake scripts
-        run: flyway -X migrate -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD"
+        run: flyway -X migrate -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD" -baselineOnMigrate="true"
         env:
           SNOWFLAKE_JDBC_URL: ${{ secrets.SNOWFLAKE_JDBC_URL }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
