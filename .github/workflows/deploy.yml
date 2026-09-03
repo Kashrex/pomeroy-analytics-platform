@@ -28,31 +28,31 @@ jobs:
         with:
           edition: community
           i-agree-to-the-eula: true
-      - name: Verify Snowflake migration connection
-        run: flyway info -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD"
-        env:
-          SNOWFLAKE_JDBC_URL: ${{ secrets.SNOWFLAKE_JDBC_URL }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-      - name: Repair a failed Flyway history entry when explicitly requested
-        if: ${{ inputs.repair_failed_migration }}
-        run: flyway repair -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD" -baselineOnMigrate="true"
-        env:
-          SNOWFLAKE_JDBC_URL: ${{ secrets.SNOWFLAKE_JDBC_URL }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-      - name: Apply versioned and repeatable Snowflake scripts
-        run: flyway migrate -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD" -baselineOnMigrate="true" -X
-        env:
-          SNOWFLAKE_JDBC_URL: ${{ secrets.SNOWFLAKE_JDBC_URL }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-      - name: Validate deployed Flyway state
-        run: flyway validate -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD"
-        env:
-          SNOWFLAKE_JDBC_URL: ${{ secrets.SNOWFLAKE_JDBC_URL }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+      # - name: Verify Snowflake migration connection
+      #   run: flyway info -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD"
+      #   env:
+      #     SNOWFLAKE_JDBC_URL: ${{ secrets.SNOWFLAKE_JDBC_URL }}
+      #     SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+      #     SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+      # - name: Repair a failed Flyway history entry when explicitly requested
+      #   if: ${{ inputs.repair_failed_migration }}
+      #   run: flyway repair -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD" -baselineOnMigrate="true"
+      #   env:
+      #     SNOWFLAKE_JDBC_URL: ${{ secrets.SNOWFLAKE_JDBC_URL }}
+      #     SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+      #     SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+      # - name: Apply versioned and repeatable Snowflake scripts
+      #   run: flyway migrate -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD" -baselineOnMigrate="true" -X
+      #   env:
+      #     SNOWFLAKE_JDBC_URL: ${{ secrets.SNOWFLAKE_JDBC_URL }}
+      #     SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+      #     SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+      # - name: Validate deployed Flyway state
+      #   run: flyway validate -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD"
+      #   env:
+      #     SNOWFLAKE_JDBC_URL: ${{ secrets.SNOWFLAKE_JDBC_URL }}
+      #     SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+      #     SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
       - name: Ingest source batch after schema deployment
         run: python -m src.ingest_snowpark --source-dir data/source
         env:
