@@ -1,32 +1,11 @@
 """
-Alternative Snowpark implementation of the Pomeroy ingestion flow.
+Snowpark implementation of the Pomeroy ingestion flow with full functional parity.
 
-This file is an alternative to src/ingest.py. It is intentionally kept
-separate so the assessment can demonstrate two viable approaches:
-
-    1. src/ingest.py          -> external Python + Snowflake Connector
-    2. src/ingest_snowpark.py  -> Snowpark Python running transformations
-                                   inside Snowflake
-
-Assumptions for this alternative:
-- Snowpark Session is created from environment variables.
-- The supplied files are available locally under --source-dir.
-- The script uploads them to an internal Snowflake stage before processing.
-- The target reference tables already exist:
-      STORES(STORE_ID, CLIENT_ID, STORE_NUMBER, REGION, ACTIVE_FLAG)
-      TECHNICIANS(TECHNICIAN_ID, TECHNICIAN_NAME, HOME_REGION, ACTIVE_FLAG)
-- The event/audit tables from the Flyway migrations already exist.
-
-This approach uses Snowflake/Snowpark for the transformation work. The
-external Python process is primarily responsible for establishing the
-session and putting source files into the Snowflake stage.
-
-Note:
-Snowflake's COPY INTO ... ON_ERROR=CONTINUE behavior can continue past
-malformed source records, but exact per-record malformed JSON payload capture
-is less straightforward than the external-Python implementation. For that
-reason, src/ingest.py remains the preferred assessment implementation when
-the requirement is to retain every rejected raw record and rejection reason.
+This version implements:
+- Batch Idempotency via INGESTION_RUNS.
+- Source tracking via Snowflake metadata columns.
+- Referential integrity checks against loaded reference data.
+- Split-stream routing to write failed records to REJECTED_RECORDS.
 """
 
 from __future__ import annotations
@@ -35,6 +14,7 @@ import argparse
 import hashlib
 import os
 import uuid
+import logging
 from pathlib import Path
 
 from snowflake.snowpark import Session
@@ -42,6 +22,7 @@ from snowflake.snowpark.functions import (
     col,
     count,
     current_timestamp,
+    is_null,
     lit,
     row_number,
     sha2,
@@ -53,17 +34,13 @@ from snowflake.snowpark.functions import (
 from snowflake.snowpark.types import StructType, StructField, StringType
 from snowflake.snowpark.window import Window
 
+VALID_EVENT_TYPES = [
+    "OPENED", "ASSIGNED", "WORK_STARTED", 
+    "WORK_COMPLETED", "REOPENED", "CLOSED"
+]
+VALID_PRIORITIES = ["P1", "P2", "P3", "P4"]
 
-VALID_EVENT_TYPES = (
-    "OPENED",
-    "ASSIGNED",
-    "WORK_STARTED",
-    "WORK_COMPLETED",
-    "REOPENED",
-    "CLOSED",
-)
-
-VALID_PRIORITIES = ("P1", "P2", "P3", "P4")
+LOGGER = logging.getLogger(__name__)
 
 
 def create_session() -> Session:
@@ -91,7 +68,6 @@ def create_session() -> Session:
 
     if os.getenv("SNOWFLAKE_WAREHOUSE"):
         connection_parameters["warehouse"] = os.environ["SNOWFLAKE_WAREHOUSE"]
-
     if os.getenv("SNOWFLAKE_ROLE"):
         connection_parameters["role"] = os.environ["SNOWFLAKE_ROLE"]
 
@@ -101,13 +77,11 @@ def create_session() -> Session:
 def source_checksum(source_files: list[Path]) -> str:
     """Create a deterministic checksum for the complete source batch."""
     digest = hashlib.sha256()
-
     for path in sorted(source_files):
         digest.update(path.name.encode("utf-8"))
         digest.update(b"\0")
         digest.update(path.read_bytes())
         digest.update(b"\0")
-
     return digest.hexdigest()
 
 
@@ -116,223 +90,143 @@ def put_source_files(session: Session, source_dir: Path, stage: str) -> None:
     session.sql(f"CREATE STAGE IF NOT EXISTS {stage}").collect()
 
     for path in sorted(source_dir.glob("*.jsonl")):
-        session.file.put(
-            str(path),
-            f"@{stage}/events",
-            auto_compress=True,
-            overwrite=True,
-        )
+        session.file.put(str(path), f"@{stage}/events", auto_compress=True, overwrite=True)
 
     for filename in ("stores.csv", "technicians.csv"):
         path = source_dir / filename
         if not path.exists():
             raise FileNotFoundError(f"Missing source file: {path}")
-
-        session.file.put(
-            str(path),
-            f"@{stage}/reference",
-            auto_compress=True,
-            overwrite=True,
-        )
+        session.file.put(str(path), f"@{stage}/reference", auto_compress=True, overwrite=True)
 
 
 def load_reference_tables(session: Session, stage: str) -> None:
-    """
-    Load STORES and TECHNICIANS using Snowpark DataFrames.
-
-    CSV files are staged first, then read as Snowpark DataFrames and merged
-    into the target reference tables.
-    """
+    """Load STORES and TECHNICIANS using Snowpark DataFrames."""
     csv_format = "POMEROY_CSV_FORMAT"
-
     session.sql(
         f"""
         CREATE FILE FORMAT IF NOT EXISTS {csv_format}
-        TYPE = CSV
-        SKIP_HEADER = 1
-        FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+        TYPE = CSV SKIP_HEADER = 1 FIELD_OPTIONALLY_ENCLOSED_BY = '"'
         """
     ).collect()
 
     store_schema = StructType([
-        StructField("STORE_ID", StringType()),
-        StructField("CLIENT_ID", StringType()),
-        StructField("STORE_NUMBER", StringType()),
-        StructField("REGION", StringType()),
+        StructField("STORE_ID", StringType()), StructField("CLIENT_ID", StringType()),
+        StructField("STORE_NUMBER", StringType()), StructField("REGION", StringType()),
         StructField("ACTIVE_FLAG", StringType())
     ])
-
-    stores = (
-        session.read.option("FIELD_DELIMITER", ",")
-        .option("SKIP_HEADER", 1)
-        .schema(store_schema)
-        .csv(f"@{stage}/reference/stores.csv.gz")
-    )
+    
+    stores = session.read.option("FIELD_DELIMITER", ",").option("SKIP_HEADER", 1)\
+        .schema(store_schema).csv(f"@{stage}/reference/stores.csv.gz")
+    stores.create_or_replace_temp_view("STG_STORES")
 
     technician_schema = StructType([
-        StructField("TECHNICIAN_ID", StringType()),
-        StructField("TECHNICIAN_NAME", StringType()),
-        StructField("HOME_REGION", StringType()),
-        StructField("ACTIVE_FLAG", StringType())
+        StructField("TECHNICIAN_ID", StringType()), StructField("TECHNICIAN_NAME", StringType()),
+        StructField("HOME_REGION", StringType()), StructField("ACTIVE_FLAG", StringType())
     ])
-
-    technicians = (
-        session.read.option("FIELD_DELIMITER", ",")
-        .option("SKIP_HEADER", 1)
-        .schema(technician_schema)
-        .csv(f"@{stage}/reference/technicians.csv.gz")
-    )
-
-    stores.create_or_replace_temp_view("STG_STORES")
+    
+    technicians = session.read.option("FIELD_DELIMITER", ",").option("SKIP_HEADER", 1)\
+        .schema(technician_schema).csv(f"@{stage}/reference/technicians.csv.gz")
     technicians.create_or_replace_temp_view("STG_TECHNICIANS")
 
-    session.sql(
-        """
-        MERGE INTO STORES target
-        USING STG_STORES source
-          ON target.STORE_ID = source.STORE_ID
-        WHEN MATCHED THEN UPDATE SET
-            CLIENT_ID = source.CLIENT_ID,
-            STORE_NUMBER = source.STORE_NUMBER,
-            REGION = source.REGION,
-            ACTIVE_FLAG = source.ACTIVE_FLAG
-        WHEN NOT MATCHED THEN INSERT
-            (STORE_ID, CLIENT_ID, STORE_NUMBER, REGION, ACTIVE_FLAG)
-        VALUES
-            (source.STORE_ID, source.CLIENT_ID, source.STORE_NUMBER,
-             source.REGION, source.ACTIVE_FLAG)
-        """
-    ).collect()
+    session.sql("""
+        MERGE INTO STORES target USING STG_STORES source ON target.STORE_ID = source.STORE_ID
+        WHEN MATCHED THEN UPDATE SET CLIENT_ID = source.CLIENT_ID, STORE_NUMBER = source.STORE_NUMBER, REGION = source.REGION, ACTIVE_FLAG = source.ACTIVE_FLAG
+        WHEN NOT MATCHED THEN INSERT (STORE_ID, CLIENT_ID, STORE_NUMBER, REGION, ACTIVE_FLAG) VALUES (source.STORE_ID, source.CLIENT_ID, source.STORE_NUMBER, source.REGION, source.ACTIVE_FLAG)
+    """).collect()
 
-    session.sql(
-        """
-        MERGE INTO TECHNICIANS target
-        USING STG_TECHNICIANS source
-          ON target.TECHNICIAN_ID = source.TECHNICIAN_ID
-        WHEN MATCHED THEN UPDATE SET
-            TECHNICIAN_NAME = source.TECHNICIAN_NAME,
-            HOME_REGION = source.HOME_REGION,
-            ACTIVE_FLAG = source.ACTIVE_FLAG
-        WHEN NOT MATCHED THEN INSERT
-            (TECHNICIAN_ID, TECHNICIAN_NAME, HOME_REGION, ACTIVE_FLAG)
-        VALUES
-            (source.TECHNICIAN_ID, source.TECHNICIAN_NAME,
-             source.HOME_REGION, source.ACTIVE_FLAG)
-        """
-    ).collect()
+    session.sql("""
+        MERGE INTO TECHNICIANS target USING STG_TECHNICIANS source ON target.TECHNICIAN_ID = source.TECHNICIAN_ID
+        WHEN MATCHED THEN UPDATE SET TECHNICIAN_NAME = source.TECHNICIAN_NAME, HOME_REGION = source.HOME_REGION, ACTIVE_FLAG = source.ACTIVE_FLAG
+        WHEN NOT MATCHED THEN INSERT (TECHNICIAN_ID, TECHNICIAN_NAME, HOME_REGION, ACTIVE_FLAG) VALUES (source.TECHNICIAN_ID, source.TECHNICIAN_NAME, source.HOME_REGION, source.ACTIVE_FLAG)
+    """).collect()
 
 
-def read_events(session: Session, stage: str):
-    """Read staged JSONL files as raw text lines to safely handle malformed JSON."""
+def process_events(session: Session, stage: str, run_id: str) -> dict:
+    """Process files, validate, isolate rejects, and deduplicate."""
     raw_format = "POMEROY_RAW_LINE_FORMAT"
-
     session.sql(
         f"""
         CREATE FILE FORMAT IF NOT EXISTS {raw_format}
-        TYPE = CSV
-        FIELD_DELIMITER = NONE
-        RECORD_DELIMITER = '\\n'
-        ESCAPE_UNENCLOSED_FIELD = NONE
+        TYPE = CSV FIELD_DELIMITER = NONE RECORD_DELIMITER = '\\n' ESCAPE_UNENCLOSED_FIELD = NONE
         """
     ).collect()
 
-    # Reads the file as a single column ($1) of raw text strings
-    return session.read.option("FORMAT_NAME", raw_format).csv(f"@{stage}/events/")
+    # 1. Read Raw Strings and Metadata
+    raw_df = session.read.option("FORMAT_NAME", raw_format).csv(f"@{stage}/events/")
+    df = raw_df.select(
+        col("METADATA$FILENAME").alias("SOURCE_FILE"),
+        col("METADATA$FILE_ROW_NUMBER").alias("SOURCE_ROW_NUMBER"),
+        col("$1").alias("RAW_PAYLOAD_STRING")
+    ).filter(col("RAW_PAYLOAD_STRING").is_not_null())  # Drop blank lines
 
+    # 2. Parse JSON safely
+    df = df.with_column("PAYLOAD", try_parse_json(col("RAW_PAYLOAD_STRING")))
 
-def normalize_events(session: Session, raw_df):
-    """
-    Flatten the nested event structure using Snowpark DataFrame expressions.
-    Safely bypasses malformed JSON strings.
-
-    The source JSON object is expected to contain:
-      event_id, work_order_id, client_id, event_type,
-      event_timestamp, updated_at, priority, source,
-      technician.id, location.store_id, location.region,
-      labor.minutes
-    """
-    # try_parse_json converts valid strings to VARIANT, but returns NULL for syntax errors
-    df = raw_df.select(try_parse_json(col("$1")).alias("PAYLOAD"))
-
-    # Isolate and drop the malformed records
-    df = df.filter(col("PAYLOAD").is_not_null())
-
-    normalized = df.select(
+    # 3. Extract Fields
+    df = df.select(
+        "*",
         col("PAYLOAD")["event_id"].cast("string").alias("EVENT_ID"),
         col("PAYLOAD")["work_order_id"].cast("string").alias("WORK_ORDER_ID"),
         col("PAYLOAD")["client_id"].cast("string").alias("CLIENT_ID"),
         upper(col("PAYLOAD")["event_type"].cast("string")).alias("EVENT_TYPE"),
-        col("PAYLOAD")["event_timestamp"]
-        .cast("string")
-        .alias("EVENT_TIMESTAMP_RAW"),
-        col("PAYLOAD")["updated_at"]
-        .cast("string")
-        .alias("UPDATED_AT_RAW"),
+        col("PAYLOAD")["event_timestamp"].cast("string").alias("EVENT_TIMESTAMP_RAW"),
+        col("PAYLOAD")["updated_at"].cast("string").alias("UPDATED_AT_RAW"),
         upper(col("PAYLOAD")["priority"].cast("string")).alias("PRIORITY"),
-        col("PAYLOAD")["technician"]["id"]
-        .cast("string")
-        .alias("TECHNICIAN_ID"),
-        col("PAYLOAD")["location"]["store_id"]
-        .cast("string")
-        .alias("STORE_ID"),
-        col("PAYLOAD")["location"]["region"]
-        .cast("string")
-        .alias("REGION"),
-        col("PAYLOAD")["labor"]["minutes"]
-        .cast("integer")
-        .alias("LABOR_MINUTES"),
-        col("PAYLOAD")["source"].cast("string").alias("SOURCE_SYSTEM"),
-        col("PAYLOAD").cast("variant").alias("RAW_PAYLOAD"),
+        col("PAYLOAD")["technician"]["id"].cast("string").alias("TECHNICIAN_ID"),
+        col("PAYLOAD")["location"]["store_id"].cast("string").alias("STORE_ID"),
+        col("PAYLOAD")["location"]["region"].cast("string").alias("REGION"),
+        col("PAYLOAD")["labor"]["minutes"].cast("integer").alias("LABOR_MINUTES"),
+        col("PAYLOAD")["source"].cast("string").alias("SOURCE_SYSTEM")
     )
 
-    normalized = normalized.select(
-        "*",
-        to_timestamp_tz(col("EVENT_TIMESTAMP_RAW")).alias("EVENT_TIMESTAMP_UTC"),
-        to_timestamp_tz(col("UPDATED_AT_RAW")).alias("UPDATED_AT_UTC"),
+    # 4. Reference Lookups
+    stores_stg = session.table("STORES").select(col("STORE_ID").alias("REF_STORE_ID"))
+    techs_stg = session.table("TECHNICIANS").select(col("TECHNICIAN_ID").alias("REF_TECH_ID"))
+    
+    df = df.join(stores_stg, df["STORE_ID"] == stores_stg["REF_STORE_ID"], "left")
+    df = df.join(techs_stg, df["TECHNICIAN_ID"] == techs_stg["REF_TECH_ID"], "left")
+
+    # 5. Validation Routing
+    df = df.with_column(
+        "REJECT_REASON",
+        when(is_null(col("PAYLOAD")), lit("Invalid JSON"))
+        .when(is_null(col("EVENT_ID")), lit("Missing event_id"))
+        .when(is_null(col("WORK_ORDER_ID")), lit("Missing work_order_id"))
+        .when(is_null(col("CLIENT_ID")), lit("Missing client_id"))
+        .when(is_null(to_timestamp_tz(col("EVENT_TIMESTAMP_RAW"))), lit("Invalid event_timestamp"))
+        .when(is_null(to_timestamp_tz(col("UPDATED_AT_RAW"))), lit("Invalid updated_at"))
+        .when(~col("EVENT_TYPE").isin(VALID_EVENT_TYPES), lit("Invalid event_type"))
+        .when(col("PRIORITY").is_not_null() & ~col("PRIORITY").isin(VALID_PRIORITIES), lit("Invalid priority"))
+        .when(col("LABOR_MINUTES").is_not_null() & (col("LABOR_MINUTES") < 0), lit("Labor minutes must be non-negative"))
+        .when(col("STORE_ID").is_not_null() & col("REF_STORE_ID").is_null(), lit("Unknown store_id"))
+        .when(col("TECHNICIAN_ID").is_not_null() & col("REF_TECH_ID").is_null(), lit("Unknown technician_id"))
+        .otherwise(None)
     )
 
-    # Keep only records that satisfy the assessment's core validation rules.
-    validated = normalized.filter(
-        col("EVENT_ID").is_not_null()
-        & col("WORK_ORDER_ID").is_not_null()
-        & col("CLIENT_ID").is_not_null()
-        & col("EVENT_TIMESTAMP_UTC").is_not_null()
-        & col("UPDATED_AT_UTC").is_not_null()
-        & col("EVENT_TYPE").isin(list(VALID_EVENT_TYPES))
-        & (
-            col("PRIORITY").is_null()
-            | col("PRIORITY").isin(list(VALID_PRIORITIES))
-        )
-        & (
-            col("LABOR_MINUTES").is_null()
-            | (col("LABOR_MINUTES") >= lit(0))
-        )
+    # 6. Split Streams
+    rejected_df = df.filter(col("REJECT_REASON").is_not_null())
+    accepted_df = df.filter(col("REJECT_REASON").is_null())
+
+    # Write Rejects
+    rejects_to_write = rejected_df.select(
+        lit(run_id).alias("RUN_ID"),
+        col("SOURCE_FILE"),
+        col("SOURCE_ROW_NUMBER"),
+        col("REJECT_REASON").alias("REASON"),
+        col("RAW_PAYLOAD_STRING").alias("RAW_PAYLOAD")
     )
+    rejects_to_write.write.mode("append").save_as_table("REJECTED_RECORDS")
+    reject_count = rejects_to_write.count()
 
-    return validated
+    # 7. Deduplicate Accepted
+    accepted_df = accepted_df.with_column("EVENT_TIMESTAMP_UTC", to_timestamp_tz(col("EVENT_TIMESTAMP_RAW")))
+    accepted_df = accepted_df.with_column("UPDATED_AT_UTC", to_timestamp_tz(col("UPDATED_AT_RAW")))
+    accepted_df = accepted_df.with_column("PAYLOAD_HASH", sha2(col("RAW_PAYLOAD_STRING"), 256))
 
-
-def deduplicate_events(df):
-    """Keep the latest correction for each EVENT_ID."""
-    payload_hash = sha2(
-        df["RAW_PAYLOAD"].cast("string"),
-        256,
-    )
-
-    window = (
-        Window.partition_by("EVENT_ID")
-        .order_by(
-            col("UPDATED_AT_UTC").desc(),
-            payload_hash.desc(),
-        )
-    )
-
-    return (
-        df.with_column("PAYLOAD_HASH", payload_hash)
-        .with_column("_RN", row_number().over(window))
-        .filter(col("_RN") == 1)
-        .drop("_RN")
-    )
+    window = Window.partition_by("EVENT_ID").order_by(col("UPDATED_AT_UTC").desc(), col("PAYLOAD_HASH").desc())
+    deduped_df = accepted_df.with_column("_RN", row_number().over(window)).filter(col("_RN") == 1).drop("_RN")
+    
+    return {"deduped_df": deduped_df, "accepted_count": accepted_df.count(), "unique_count": deduped_df.count(), "reject_count": reject_count}
 
 
 def load_events(session: Session, events_df, run_id: str) -> None:
@@ -340,143 +234,75 @@ def load_events(session: Session, events_df, run_id: str) -> None:
     events_df = events_df.with_column("RUN_ID", lit(run_id))
     events_df.create_or_replace_temp_view("STG_WORK_ORDER_EVENTS")
 
-    session.sql(
-        """
-        MERGE INTO WORK_ORDER_EVENTS target
-        USING STG_WORK_ORDER_EVENTS source
-          ON target.EVENT_ID = source.EVENT_ID
-
-        WHEN MATCHED AND (
-            source.UPDATED_AT_UTC > target.UPDATED_AT_UTC
-            OR (
-                source.UPDATED_AT_UTC = target.UPDATED_AT_UTC
-                AND source.PAYLOAD_HASH <> target.PAYLOAD_HASH
-            )
-        )
+    session.sql("""
+        MERGE INTO WORK_ORDER_EVENTS target USING STG_WORK_ORDER_EVENTS source ON target.EVENT_ID = source.EVENT_ID
+        WHEN MATCHED AND (source.UPDATED_AT_UTC > target.UPDATED_AT_UTC OR (source.UPDATED_AT_UTC = target.UPDATED_AT_UTC AND source.PAYLOAD_HASH <> target.PAYLOAD_HASH))
         THEN UPDATE SET
-            WORK_ORDER_ID = source.WORK_ORDER_ID,
-            CLIENT_ID = source.CLIENT_ID,
-            EVENT_TYPE = source.EVENT_TYPE,
-            EVENT_TIMESTAMP_UTC = source.EVENT_TIMESTAMP_UTC,
-            UPDATED_AT_UTC = source.UPDATED_AT_UTC,
-            PRIORITY = source.PRIORITY,
-            TECHNICIAN_ID = source.TECHNICIAN_ID,
-            STORE_ID = source.STORE_ID,
-            REGION = source.REGION,
-            LABOR_MINUTES = source.LABOR_MINUTES,
-            SOURCE_SYSTEM = source.SOURCE_SYSTEM,
-            SOURCE_FILE = 'snowpark_stage',
-            SOURCE_ROW_NUMBER = NULL,
-            PAYLOAD_HASH = source.PAYLOAD_HASH,
-            RAW_PAYLOAD = source.RAW_PAYLOAD,
-            LAST_SEEN_AT = CURRENT_TIMESTAMP()
-
+            WORK_ORDER_ID = source.WORK_ORDER_ID, CLIENT_ID = source.CLIENT_ID, EVENT_TYPE = source.EVENT_TYPE,
+            EVENT_TIMESTAMP_UTC = source.EVENT_TIMESTAMP_UTC, UPDATED_AT_UTC = source.UPDATED_AT_UTC,
+            PRIORITY = source.PRIORITY, TECHNICIAN_ID = source.TECHNICIAN_ID, STORE_ID = source.STORE_ID,
+            REGION = source.REGION, LABOR_MINUTES = source.LABOR_MINUTES, SOURCE_SYSTEM = source.SOURCE_SYSTEM,
+            SOURCE_FILE = source.SOURCE_FILE, SOURCE_ROW_NUMBER = source.SOURCE_ROW_NUMBER,
+            PAYLOAD_HASH = source.PAYLOAD_HASH, RAW_PAYLOAD = source.PAYLOAD, LAST_SEEN_AT = CURRENT_TIMESTAMP()
         WHEN NOT MATCHED THEN INSERT (
-            EVENT_ID,
-            WORK_ORDER_ID,
-            CLIENT_ID,
-            EVENT_TYPE,
-            EVENT_TIMESTAMP_UTC,
-            UPDATED_AT_UTC,
-            PRIORITY,
-            TECHNICIAN_ID,
-            STORE_ID,
-            REGION,
-            LABOR_MINUTES,
-            SOURCE_SYSTEM,
-            SOURCE_FILE,
-            SOURCE_ROW_NUMBER,
-            PAYLOAD_HASH,
-            RAW_PAYLOAD,
-            FIRST_SEEN_AT,
-            LAST_SEEN_AT
+            EVENT_ID, WORK_ORDER_ID, CLIENT_ID, EVENT_TYPE, EVENT_TIMESTAMP_UTC, UPDATED_AT_UTC,
+            PRIORITY, TECHNICIAN_ID, STORE_ID, REGION, LABOR_MINUTES, SOURCE_SYSTEM,
+            SOURCE_FILE, SOURCE_ROW_NUMBER, PAYLOAD_HASH, RAW_PAYLOAD, FIRST_SEEN_AT, LAST_SEEN_AT
+        ) VALUES (
+            source.EVENT_ID, source.WORK_ORDER_ID, source.CLIENT_ID, source.EVENT_TYPE, source.EVENT_TIMESTAMP_UTC, source.UPDATED_AT_UTC,
+            source.PRIORITY, source.TECHNICIAN_ID, source.STORE_ID, source.REGION, source.LABOR_MINUTES, source.SOURCE_SYSTEM,
+            source.SOURCE_FILE, source.SOURCE_ROW_NUMBER, source.PAYLOAD_HASH, source.PAYLOAD, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
         )
-        VALUES (
-            source.EVENT_ID,
-            source.WORK_ORDER_ID,
-            source.CLIENT_ID,
-            source.EVENT_TYPE,
-            source.EVENT_TIMESTAMP_UTC,
-            source.UPDATED_AT_UTC,
-            source.PRIORITY,
-            source.TECHNICIAN_ID,
-            source.STORE_ID,
-            source.REGION,
-            source.LABOR_MINUTES,
-            source.SOURCE_SYSTEM,
-            'snowpark_stage',
-            NULL,
-            source.PAYLOAD_HASH,
-            source.RAW_PAYLOAD,
-            CURRENT_TIMESTAMP(),
-            CURRENT_TIMESTAMP()
-        )
-        """
-    ).collect()
+    """).collect()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Alternative Snowpark ingestion implementation."
-    )
+    parser = argparse.ArgumentParser()
     parser.add_argument("--source-dir", type=Path, required=True)
-    parser.add_argument(
-        "--stage",
-        default="POMEROY_INGEST_STAGE",
-        help="Snowflake internal stage used for source files.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Validate/transform through Snowpark without merging events.",
-    )
+    parser.add_argument("--stage", default="POMEROY_INGEST_STAGE")
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     source_dir = args.source_dir
     event_files = sorted(source_dir.glob("work_order_events_*.jsonl"))
-    source_files = event_files + [
-        source_dir / "stores.csv",
-        source_dir / "technicians.csv",
-    ]
+    source_files = event_files + [source_dir / "stores.csv", source_dir / "technicians.csv"]
 
     if not event_files:
         raise FileNotFoundError("No work_order_events_*.jsonl files found")
 
-    for path in source_files:
-        if not path.exists():
-            raise FileNotFoundError(f"Missing source file: {path}")
-
     checksum = source_checksum(source_files)
     run_id = str(uuid.uuid4())
-
     session = create_session()
 
     try:
+        # Idempotency Check
+        existing_run = session.table("INGESTION_RUNS").filter(col("SOURCE_CHECKSUM") == checksum).collect()
+        if existing_run:
+            LOGGER.info("source checksum already loaded; skipping event load")
+            return
+
         put_source_files(session, source_dir, args.stage)
         load_reference_tables(session, args.stage)
 
-        raw_events = read_events(session, args.stage)
-        normalized = normalize_events(session, raw_events)
-        current = deduplicate_events(normalized)
-
-        stats = {
-            "files_read": len(source_files),
-            "event_files": len(event_files),
-            "unique_valid_events": current.count(),
-            "source_checksum": checksum,
-        }
-
-        print(f"Snowpark processing statistics: {stats}")
+        # Process and track
+        results = process_events(session, args.stage, run_id)
+        
+        # Log Run metadata
+        session.sql(f"""
+            INSERT INTO INGESTION_RUNS (RUN_ID, SOURCE_CHECKSUM, FILE_COUNT, RECORD_COUNT, UNIQUE_EVENT_COUNT, REJECTED_COUNT, COMPLETED_AT)
+            VALUES ('{run_id}', '{checksum}', {len(source_files)}, {results['accepted_count'] + results['reject_count']}, {results['unique_count']}, {results['reject_count']}, CURRENT_TIMESTAMP())
+        """).collect()
 
         if not args.dry_run:
-            load_events(session, current, run_id)
-            print(f"Snowpark load completed: {run_id}")
+            load_events(session, results["deduped_df"], run_id)
+            LOGGER.info("Snowpark load result: %s", run_id)
         else:
-            print("Snowpark dry-run completed; event merge skipped.")
+            LOGGER.info("Snowpark dry-run completed; event merge skipped.")
 
     finally:
         session.close()
-
 
 if __name__ == "__main__":
     main()
