@@ -46,6 +46,7 @@ from snowflake.snowpark.functions import (
     row_number,
     sha2,
     to_timestamp_tz,
+    try_parse_json,
     upper,
     when,
 )
@@ -222,23 +223,27 @@ def load_reference_tables(session: Session, stage: str) -> None:
 
 
 def read_events(session: Session, stage: str):
-    """Read staged JSONL files as Snowpark VARIANT rows."""
-    json_format = "POMEROY_JSON_FORMAT"
+    """Read staged JSONL files as raw text lines to safely handle malformed JSON."""
+    raw_format = "POMEROY_RAW_LINE_FORMAT"
 
     session.sql(
         f"""
-        CREATE FILE FORMAT IF NOT EXISTS {json_format}
-        TYPE = JSON
-        STRIP_OUTER_ARRAY = FALSE
+        CREATE FILE FORMAT IF NOT EXISTS {raw_format}
+        TYPE = CSV
+        FIELD_DELIMITER = NONE
+        RECORD_DELIMITER = '\\n'
+        ESCAPE_UNENCLOSED_FIELD = NONE
         """
     ).collect()
 
-    return session.read.json(f"@{stage}/events/")
+    # Reads the file as a single column ($1) of raw text strings
+    return session.read.option("FORMAT_NAME", raw_format).csv(f"@{stage}/events/")
 
 
 def normalize_events(session: Session, raw_df):
     """
     Flatten the nested event structure using Snowpark DataFrame expressions.
+    Safely bypasses malformed JSON strings.
 
     The source JSON object is expected to contain:
       event_id, work_order_id, client_id, event_type,
@@ -246,7 +251,11 @@ def normalize_events(session: Session, raw_df):
       technician.id, location.store_id, location.region,
       labor.minutes
     """
-    df = raw_df.select(col("$1").alias("PAYLOAD"))
+    # try_parse_json converts valid strings to VARIANT, but returns NULL for syntax errors
+    df = raw_df.select(try_parse_json(col("$1")).alias("PAYLOAD"))
+
+    # Isolate and drop the malformed records
+    df = df.filter(col("PAYLOAD").is_not_null())
 
     normalized = df.select(
         col("PAYLOAD")["event_id"].cast("string").alias("EVENT_ID"),
