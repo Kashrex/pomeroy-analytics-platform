@@ -19,9 +19,8 @@ jobs:
       - name: Compile Python
         run: python -m compileall -q src
             - name: Validate Flyway files
-        run: |
+        run:
           test -f flyway.toml
-
           for file in \
             sql/flyway/V001__create_ingestion_runs.sql \
             sql/flyway/V002__create_WORK_ORDER_EVENTS.sql \
