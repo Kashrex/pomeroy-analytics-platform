@@ -151,7 +151,7 @@ def process_events(session: Session, stage: str, run_id: str) -> dict:
         """
     ).collect()
 
-    # 1. Define the table explicitly, then insert to bypass stage CTAS limitations
+    # 1. Bypass all SELECT subquery limits by using Snowflake's native COPY INTO command
     session.sql(
         """
         CREATE OR REPLACE TEMPORARY TABLE STG_RAW_EVENTS (
@@ -164,17 +164,20 @@ def process_events(session: Session, stage: str, run_id: str) -> dict:
 
     session.sql(
         f"""
-        INSERT INTO STG_RAW_EVENTS (SOURCE_FILE, SOURCE_ROW_NUMBER, RAW_PAYLOAD_STRING)
-        SELECT 
-            METADATA$FILENAME,
-            METADATA$FILE_ROW_NUMBER,
-            $1
-        FROM @{stage}/events/ (FORMAT_NAME => '{raw_format}')
-        WHERE $1 IS NOT NULL
+        COPY INTO STG_RAW_EVENTS (SOURCE_FILE, SOURCE_ROW_NUMBER, RAW_PAYLOAD_STRING)
+        FROM (
+            SELECT 
+                METADATA$FILENAME,
+                METADATA$FILE_ROW_NUMBER,
+                $1
+            FROM @{stage}/events/
+        )
+        FILE_FORMAT = (FORMAT_NAME = '{raw_format}')
         """
     ).collect()
 
-    # df = session.table("STG_RAW_EVENTS")
+    # Drop the blank lines directly via Snowpark filter on the native table
+    df = session.table("STG_RAW_EVENTS").filter(col("RAW_PAYLOAD_STRING").is_not_null())
 
     df = session.table("STG_RAW_EVENTS")
 
