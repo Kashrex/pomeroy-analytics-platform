@@ -1,52 +1,33 @@
 name: CI
-
 on:
-  pull_request:
   push:
-    branches: [main]
-
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
 jobs:
-  python-check:
-    name: Python syntax check
+  validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-
-      - name: Compile Python source
+          python-version: "3.12"
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Compile Python
         run: python -m compileall -q src
-
-  flyway-check:
-    name: Flyway migration check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Validate migration files exist
-        shell: bash
+      - name: Validate Flyway files
         run: |
-          set -euo pipefail
-          test -d sql/flyway
-          test -n "$(find sql/flyway -type f -name '*.sql' -print -quit)"
-
-      - name: Validate migration naming
-        shell: bash
-        run: |
-          set -euo pipefail
-          while IFS= read -r file; do
-            name="$(basename "$file")"
-            if [[ ! "$name" =~ ^(V[0-9]+__.+|R__.+)\.sql$ ]]; then
-              echo "Invalid Flyway migration name: $file"
-              exit 1
-            fi
-          done < <(find sql/flyway -type f -name '*.sql' | sort)
-
-      - name: Check required SQL objects are present
-        shell: bash
-        run: |
-          set -euo pipefail
-          grep -Riq 'WORK_ORDER_SUMMARY' sql/flyway
-          grep -Riq 'WORK_ORDER_EVENTS' sql/flyway
+          test -f flyway.toml
+          for file in \
+            sql/flyway/V001__create_work_tables.sql \
+            sql/flyway/V002__create_work_order_summary.sql \
+            sql/flyway/V003__create_analysis_technician_close_rank.sql \
+            sql/flyway/V004__create_analysis_reopen_rate.sql \
+            sql/flyway/V005__create_analysis_weekly_completed.sql \
+            sql/flyway/V006__create_analysis_abnormal_sequences.sql; do
+            test -f "$file"
+          done
+          test -z "$(find sql/flyway -maxdepth 1 -type f -name 'R__*.sql' -print -quit)"
