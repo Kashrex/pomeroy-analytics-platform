@@ -38,14 +38,14 @@ jobs:
           SNOWFLAKE_JDBC_URL: ${{ secrets.SNOWFLAKE_JDBC_URL }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-      - name: Validate Flyway migration scripts
-        run: flyway validate -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD"
+      - name: Apply versioned and repeatable Snowflake scripts
+        run: flyway migrate -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD"
         env:
           SNOWFLAKE_JDBC_URL: ${{ secrets.SNOWFLAKE_JDBC_URL }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-      - name: Apply versioned and repeatable Snowflake scripts
-        run: flyway migrate -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD"
+      - name: Validate deployed Flyway state
+        run: flyway validate -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD"
         env:
           SNOWFLAKE_JDBC_URL: ${{ secrets.SNOWFLAKE_JDBC_URL }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
