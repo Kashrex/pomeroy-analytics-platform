@@ -153,10 +153,14 @@ def process_events(session: Session, stage: str, run_id: str) -> dict:
 
     # 1. Read Raw Strings and Metadata
     raw_df = session.read.option("FORMAT_NAME", raw_format).csv(f"@{stage}/events/")
-    df = raw_df.select(
-        col("METADATA$FILENAME").alias("SOURCE_FILE"),
-        col("METADATA$FILE_ROW_NUMBER").alias("SOURCE_ROW_NUMBER"),
-        col("$1").alias("RAW_PAYLOAD_STRING")
+    df = session.sql(
+        f"""
+        SELECT 
+            METADATA$FILENAME AS SOURCE_FILE,
+            METADATA$FILE_ROW_NUMBER AS SOURCE_ROW_NUMBER,
+            $1 AS RAW_PAYLOAD_STRING
+        FROM @{stage}/events/ (FORMAT_NAME => '{raw_format}')
+        """
     ).filter(col("RAW_PAYLOAD_STRING").is_not_null())  # Drop blank lines
 
     # 2. Parse JSON safely
