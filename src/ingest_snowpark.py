@@ -4,7 +4,7 @@ Alternative Snowpark implementation of the Pomeroy ingestion flow.
 This file is an alternative to src/ingest.py. It is intentionally kept
 separate so the assessment can demonstrate two viable approaches:
 
-    1. src/ingest.py           -> external Python + Snowflake Connector
+    1. src/ingest.py          -> external Python + Snowflake Connector
     2. src/ingest_snowpark.py  -> Snowpark Python running transformations
                                    inside Snowflake
 
@@ -49,12 +49,7 @@ from snowflake.snowpark.functions import (
     upper,
     when,
 )
-from snowflake.snowpark.types import (
-    IntegerType,
-    StringType,
-    StructField,
-    StructType,
-)
+from snowflake.snowpark.types import StructType, StructField, StringType
 from snowflake.snowpark.window import Window
 
 
@@ -68,29 +63,6 @@ VALID_EVENT_TYPES = (
 )
 
 VALID_PRIORITIES = ("P1", "P2", "P3", "P4")
-
-# Explicit Snowpark schemas for the reference CSV files. DataFrameReader.schema()
-# requires a StructType (built from StructField objects), not a plain list of
-# column-name strings -- passing a list causes:
-#   AttributeError: 'list' object has no attribute 'fields'
-STORES_SCHEMA = StructType(
-    [
-        StructField("STORE_ID", StringType()),
-        StructField("CLIENT_ID", StringType()),
-        StructField("STORE_NUMBER", StringType()),
-        StructField("REGION", StringType()),
-        StructField("ACTIVE_FLAG", StringType()),
-    ]
-)
-
-TECHNICIANS_SCHEMA = StructType(
-    [
-        StructField("TECHNICIAN_ID", StringType()),
-        StructField("TECHNICIAN_NAME", StringType()),
-        StructField("HOME_REGION", StringType()),
-        StructField("ACTIVE_FLAG", StringType()),
-    ]
-)
 
 
 def create_session() -> Session:
@@ -181,17 +153,32 @@ def load_reference_tables(session: Session, stage: str) -> None:
         """
     ).collect()
 
+    store_schema = StructType([
+        StructField("STORE_ID", StringType()),
+        StructField("CLIENT_ID", StringType()),
+        StructField("STORE_NUMBER", StringType()),
+        StructField("REGION", StringType()),
+        StructField("ACTIVE_FLAG", StringType())
+    ])
+
     stores = (
         session.read.option("FIELD_DELIMITER", ",")
         .option("SKIP_HEADER", 1)
-        .schema(STORES_SCHEMA)
+        .schema(store_schema)
         .csv(f"@{stage}/reference/stores.csv.gz")
     )
+
+    technician_schema = StructType([
+        StructField("TECHNICIAN_ID", StringType()),
+        StructField("TECHNICIAN_NAME", StringType()),
+        StructField("HOME_REGION", StringType()),
+        StructField("ACTIVE_FLAG", StringType())
+    ])
 
     technicians = (
         session.read.option("FIELD_DELIMITER", ",")
         .option("SKIP_HEADER", 1)
-        .schema(TECHNICIANS_SCHEMA)
+        .schema(technician_schema)
         .csv(f"@{stage}/reference/technicians.csv.gz")
     )
 
@@ -235,23 +222,8 @@ def load_reference_tables(session: Session, stage: str) -> None:
 
 
 def read_events(session: Session, stage: str):
-    """
-    Load staged JSONL files into a staging table as VARIANT rows.
-
-    NOTE: session.read.json(...) compiles to a plain SELECT against the
-    staged files, and Snowflake's JSON parser has no per-record error
-    tolerance in a SELECT -- a single malformed JSON line anywhere in a
-    file (e.g. a missing colon) raises SnowparkSQLException and aborts the
-    entire read.
-
-    COPY INTO, by contrast, is a load operation and does support
-    ON_ERROR = 'CONTINUE', which skips individual malformed records
-    instead of failing the whole batch. We therefore stage the raw
-    payloads into a temporary table via COPY INTO rather than querying
-    the files directly.
-    """
+    """Read staged JSONL files as Snowpark VARIANT rows."""
     json_format = "POMEROY_JSON_FORMAT"
-    staging_table = "STG_RAW_EVENTS"
 
     session.sql(
         f"""
@@ -261,54 +233,7 @@ def read_events(session: Session, stage: str):
         """
     ).collect()
 
-    session.sql(
-        f"""
-        CREATE TEMPORARY TABLE IF NOT EXISTS {staging_table} (
-            PAYLOAD VARIANT,
-            SOURCE_FILE STRING,
-            SOURCE_ROW_NUMBER NUMBER
-        )
-        """
-    ).collect()
-
-    # Guard against leftover rows if the session/table is reused.
-    session.sql(f"TRUNCATE TABLE {staging_table}").collect()
-
-    copy_results = session.sql(
-        f"""
-        COPY INTO {staging_table} (PAYLOAD, SOURCE_FILE, SOURCE_ROW_NUMBER)
-        FROM (
-            SELECT
-                $1,
-                METADATA$FILENAME,
-                METADATA$FILE_ROW_NUMBER
-            FROM @{stage}/events/
-        )
-        FILE_FORMAT = (FORMAT_NAME = {json_format})
-        ON_ERROR = 'CONTINUE'
-        PURGE = FALSE
-        """
-    ).collect()
-
-    total_rows_loaded = 0
-    total_rows_parsed = 0
-    for row in copy_results:
-        row_dict = row.as_dict()
-        print(f"COPY INTO status: {row_dict}")
-        total_rows_loaded += row_dict.get("rows_loaded") or 0
-        total_rows_parsed += row_dict.get("rows_parsed") or 0
-
-    skipped = total_rows_parsed - total_rows_loaded
-    if skipped:
-        print(
-            f"Warning: {skipped} malformed JSON record(s) were skipped "
-            f"during load (rows_parsed={total_rows_parsed}, "
-            f"rows_loaded={total_rows_loaded}). Individual rejection "
-            f"reasons are not captured per-record in this Snowpark path; "
-            f"use src/ingest.py if that level of detail is required."
-        )
-
-    return session.table(staging_table)
+    return session.read.json(f"@{stage}/events/")
 
 
 def normalize_events(session: Session, raw_df):
@@ -321,11 +246,7 @@ def normalize_events(session: Session, raw_df):
       technician.id, location.store_id, location.region,
       labor.minutes
     """
-    df = raw_df.select(
-        col("PAYLOAD"),
-        col("SOURCE_FILE"),
-        col("SOURCE_ROW_NUMBER"),
-    )
+    df = raw_df.select(col("$1").alias("PAYLOAD"))
 
     normalized = df.select(
         col("PAYLOAD")["event_id"].cast("string").alias("EVENT_ID"),
@@ -353,8 +274,6 @@ def normalize_events(session: Session, raw_df):
         .alias("LABOR_MINUTES"),
         col("PAYLOAD")["source"].cast("string").alias("SOURCE_SYSTEM"),
         col("PAYLOAD").cast("variant").alias("RAW_PAYLOAD"),
-        col("SOURCE_FILE"),
-        col("SOURCE_ROW_NUMBER"),
     )
 
     normalized = normalized.select(
@@ -437,8 +356,8 @@ def load_events(session: Session, events_df, run_id: str) -> None:
             REGION = source.REGION,
             LABOR_MINUTES = source.LABOR_MINUTES,
             SOURCE_SYSTEM = source.SOURCE_SYSTEM,
-            SOURCE_FILE = source.SOURCE_FILE,
-            SOURCE_ROW_NUMBER = source.SOURCE_ROW_NUMBER,
+            SOURCE_FILE = 'snowpark_stage',
+            SOURCE_ROW_NUMBER = NULL,
             PAYLOAD_HASH = source.PAYLOAD_HASH,
             RAW_PAYLOAD = source.RAW_PAYLOAD,
             LAST_SEEN_AT = CURRENT_TIMESTAMP()
