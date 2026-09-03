@@ -1,0 +1,34 @@
+# Pomeroy Analytics Platform
+
+An assessment-sized Snowflake medallion implementation for work-order events. It processes all three JSONL event files plus the store and technician reference CSVs, keeps rejected records reviewable, and exposes a one-row-per-work-order curated view.
+
+## Run locally
+
+1. Create a virtual environment and run `pip install -r requirements.txt`.
+2. Apply the migration scripts with Flyway from the repository root: `flyway migrate -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD"`.
+3. Set `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_PASSWORD`, and `SNOWFLAKE_DATABASE` (optionally warehouse, role, and schema).
+4. Validate without loading: `python -m src.ingest --source-dir <source-files-directory> --dry-run`.
+5. Load: `python -m src.ingest --source-dir <source-files-directory>`.
+
+Run tests with `pytest -q`.
+
+## Design decisions
+
+- Bronze retains received valid payloads and provenance; rejects retain source file, row, reason, and payload where JSON is parseable.
+- Silver stores one current version per `EVENT_ID`. A later `UPDATED_AT` replaces an older event; an equal timestamp with a changed payload is also treated as a correction.
+- Gold is the `WORK_ORDER_SUMMARY` view. Its grain is exactly one `WORK_ORDER_ID`.
+- `INGESTION_RUNS` records each batch. A completed identical source checksum is skipped; the Silver merge is also deterministic, so correction replays cannot create duplicate current events.
+
+## Validation and assumptions
+
+- Required event fields: event ID, work-order ID, client ID, event type, event timestamp, and update timestamp.
+- Nested `technician`, `location`, and `labor` values must be objects when present. Labor minutes must be a non-negative integer.
+- Accept priorities P1-P4 when present. Bad JSON, blank JSONL lines, invalid timestamps, and invalid values are quarantined while other rows continue.
+- Offset-aware timestamps are converted to UTC. Naive timestamps are assumed UTC; this must be confirmed with the source owner before production.
+- `OPENED`, `CLOSED`, `REOPENED`, and `WORK_COMPLETED` are the event semantics used by the curated model. Confirm the source event-type contract before production.
+
+## Data-quality checks and limitations
+
+`ANALYSIS_ABNORMAL_SEQUENCES` flags missing opens, close-before-open, a reopen history ending in closed, and single-event work orders. The current file loader intentionally reads each input batch in memory; for large production volumes replace it with streaming staging uploads. Reference CSV history is type-1 only. Production should use key-pair/OAuth authentication, a secret manager, API cursor checkpoints, dead-letter retention policy, observability dashboards, and alert thresholds.
+
+See [architecture.md](architecture.md) for the production design.

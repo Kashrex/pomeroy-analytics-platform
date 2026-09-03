@@ -1,0 +1,5 @@
+[flyway]
+locations = ["filesystem:sql/flyway"]
+defaultSchema = "WORK"
+schemas = ["WORK"]
+cleanDisabled = true
