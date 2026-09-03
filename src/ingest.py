@@ -238,20 +238,44 @@ def snowflake_connection():
     )
 
 
-def load_to_snowflake(events: list[Event], rejects: list[Reject], checksum: str) -> str:
+def load_to_snowflake(
+    events: list[Event],
+    rejects: list[Reject],
+    stores: dict[str, dict[str, str]],
+    technicians: dict[str, dict[str, str]],
+    checksum: str,
+) -> str:
     run_id = str(uuid.uuid4())
     conn = snowflake_connection()
     cur = conn.cursor()
 
     try:
+        # Load reference CSVs first. MERGE keeps these loads idempotent.
+        cur.execute("CREATE TEMPORARY TABLE STAGE_STORES (STORE_ID STRING, CLIENT_ID STRING, STORE_NUMBER STRING, REGION STRING, ACTIVE_FLAG STRING)")
+        cur.execute("CREATE TEMPORARY TABLE STAGE_TECHNICIANS (TECHNICIAN_ID STRING, TECHNICIAN_NAME STRING, HOME_REGION STRING, ACTIVE_FLAG STRING)")
+
+        if stores:
+            cur.executemany(
+                "INSERT INTO STAGE_STORES (STORE_ID, CLIENT_ID, STORE_NUMBER, REGION, ACTIVE_FLAG) VALUES (%s, %s, %s, %s, %s)",
+                [(r.get("store_id"), r.get("client_id"), r.get("store_number"), r.get("region"), r.get("active_flag")) for r in stores.values()],
+            )
+        if technicians:
+            cur.executemany(
+                "INSERT INTO STAGE_TECHNICIANS (TECHNICIAN_ID, TECHNICIAN_NAME, HOME_REGION, ACTIVE_FLAG) VALUES (%s, %s, %s, %s)",
+                [(r.get("technician_id"), r.get("technician_name"), r.get("home_region"), r.get("active_flag")) for r in technicians.values()],
+            )
+
+        cur.execute("MERGE INTO STORES target USING STAGE_STORES source ON target.STORE_ID = source.STORE_ID WHEN MATCHED THEN UPDATE SET CLIENT_ID=source.CLIENT_ID, STORE_NUMBER=source.STORE_NUMBER, REGION=source.REGION, ACTIVE_FLAG=source.ACTIVE_FLAG WHEN NOT MATCHED THEN INSERT (STORE_ID, CLIENT_ID, STORE_NUMBER, REGION, ACTIVE_FLAG) VALUES (source.STORE_ID, source.CLIENT_ID, source.STORE_NUMBER, source.REGION, source.ACTIVE_FLAG)")
+        cur.execute("MERGE INTO TECHNICIANS target USING STAGE_TECHNICIANS source ON target.TECHNICIAN_ID = source.TECHNICIAN_ID WHEN MATCHED THEN UPDATE SET TECHNICIAN_NAME=source.TECHNICIAN_NAME, HOME_REGION=source.HOME_REGION, ACTIVE_FLAG=source.ACTIVE_FLAG WHEN NOT MATCHED THEN INSERT (TECHNICIAN_ID, TECHNICIAN_NAME, HOME_REGION, ACTIVE_FLAG) VALUES (source.TECHNICIAN_ID, source.TECHNICIAN_NAME, source.HOME_REGION, source.ACTIVE_FLAG)")
+
         cur.execute(
             "SELECT RUN_ID FROM INGESTION_RUNS WHERE SOURCE_CHECKSUM=%s",
             (checksum,),
         )
         existing_run = cur.fetchone()
         if existing_run:
-            conn.rollback()
-            LOGGER.info("source checksum already loaded; skipping")
+            conn.commit()
+            LOGGER.info("source checksum already loaded; reference tables reconciled; skipping event load")
             return existing_run[0]
 
         cur.execute(
@@ -483,7 +507,7 @@ def main() -> None:
         LOGGER.info("dry-run completed; Snowflake load skipped")
         return
 
-    run_id = load_to_snowflake(current, rejects, checksum)
+    run_id = load_to_snowflake(current, rejects, stores, technicians, checksum)
     LOGGER.info("Snowflake load result: %s", run_id)
 
 
