@@ -1,427 +1,393 @@
 # Production Architecture
 
-## 1. Architecture objective
+## Pomeroy Work-Order Ingestion
 
-The assessment implementation is intentionally small, but the production design should preserve the same separation of responsibilities:
+### 1. Current assessment implementation
 
-- **Python** owns external ingestion, validation, normalization, reference checks, and batch control.
-- **Snowflake** owns durable storage, transformation into the curated work-order model, and analytics.
-- **An orchestrator** controls scheduling, retries, dependencies, and operational state.
-- **GitHub Actions / CI/CD** controls code and database deployment.
-
-The design avoids introducing stored procedures or unnecessary processing layers when the same requirement can be handled more simply by Python or Snowflake SQL.
-
-## 2. High-level architecture
+The submitted implementation is a **Python + Snowpark** batch ingestion process.
 
 ```text
-                         +----------------------+
-                         |   Work Order REST    |
-                         |        API           |
-                         +----------+-----------+
-                                    |
-                              Hourly ingestion
-                                    |
-                                    v
-                         +----------------------+
-                         | Airflow / MWAA        |
-                         | Orchestration         |
-                         +----------+-----------+
-                                    |
-                                    v
-                         +----------------------+
-                         | Python ingestion      |
-                         |----------------------|
-                         | Pagination            |
-                         | Checkpoint handling   |
-                         | Validation            |
-                         | UTC normalization     |
-                         | Reference checks      |
-                         | Correction handling   |
-                         | Reject capture        |
-                         | Idempotency           |
-                         +----------+-----------+
-                                    |
-                                    v
-                         +----------------------+
-                         |      Snowflake       |
-                         |----------------------|
-                         | STORES               |
-                         | TECHNICIANS          |
-                         | WORK_ORDER_EVENTS    |
-                         | REJECTED_RECORDS     |
-                         | INGESTION_RUNS       |
-                         +----------+-----------+
-                                    |
-                                    v
-                         +----------------------+
-                         | WORK_ORDER_SUMMARY   |
-                         +----------+-----------+
-                                    |
-             +----------------------+----------------------+
-             |                      |                      |
-             v                      v                      v
-      Technician close       Reopen-rate analysis    Weekly completed
-          ranking                                      analysis
-             |
-             v
-      Abnormal sequences
+ data/source/
+ ├── work_order_events_01.jsonl
+ ├── work_order_events_02.jsonl
+ ├── work_order_events_03.jsonl
+ ├── stores.csv
+ └── technicians.csv
+          |
+          v
+ ┌───────────────────────────────┐
+ │ Python / Snowpark             │
+ │                               │
+ │ 1. Discover source files      │
+ │ 2. SHA-256 batch checksum     │
+ │ 3. Idempotency check          │
+ │ 4. Upload to Snowflake stage  │
+ │ 5. Load reference data        │
+ │ 6. COPY raw JSONL lines       │
+ │ 7. TRY_PARSE_JSON             │
+ │ 8. Normalize nested fields    │
+ │ 9. Validate records           │
+ │ 10. Route rejects             │
+ │ 11. Deduplicate EVENT_ID      │
+ │ 12. MERGE canonical events    │
+ └───────────────┬───────────────┘
+                 |
+                 v
+ ┌─────────────────────────────────────────┐
+ │ Snowflake                               │
+ │                                         │
+ │ INGESTION_RUNS                           │
+ │ REJECTED_RECORDS                         │
+ │ WORK_ORDER_EVENTS                        │
+ │ STORES                                   │
+ │ TECHNICIANS                              │
+ │ WORK_ORDER_SUMMARY                       │
+ │ ANALYSIS_*                               │
+ └─────────────────────────────────────────┘
 ```
 
-## 3. Current assessment implementation
+### 2. Why the implementation uses Snowpark
 
-For the assessment, the external API is represented by local source files:
+The working ingestion implementation keeps source processing close to Snowflake.
+
+The JSONL files are uploaded to an internal Snowflake stage. Snowflake's native `COPY INTO` is used to stage the raw line together with source filename and row number. Snowpark then performs parsing, normalization, validation, reference joins, caching, and deduplication.
+
+This gives the process:
+
+- source traceability
+- safe malformed-record handling
+- Snowflake-side reference validation
+- deterministic deduplication
+- a direct path into the canonical event table
+
+### 3. Data-quality and reject flow
 
 ```text
-data/source/
-  work_order_events_01.jsonl
-  work_order_events_02.jsonl
-  work_order_events_03.jsonl
-  stores.csv
-  technicians.csv
+                    Raw JSONL
+                       |
+                       v
+                TRY_PARSE_JSON
+                       |
+             ┌─────────┴─────────┐
+             |                   |
+          invalid               valid
+             |                   |
+             v                   v
+    REJECTED_RECORDS       Field extraction
+                                 |
+                                 v
+                         Reference validation
+                                 |
+                         ┌───────┴────────┐
+                         |                |
+                      rejected          accepted
+                         |                |
+                         v                v
+                REJECTED_RECORDS    Dedup by EVENT_ID
+                                          |
+                                          v
+                                   WORK_ORDER_EVENTS
 ```
 
-Python processes the source data and loads it into Snowflake.
+Validation covers:
 
-The flow is:
+- JSON validity
+- required identifiers
+- timestamp validity
+- event type
+- priority
+- non-negative labor
+- store existence
+- technician existence
+
+Every rejected record retains the source filename, source row number, raw payload, run ID, and rejection reason.
+
+### 4. Duplicate and correction handling
+
+Accepted records are partitioned by `EVENT_ID`.
 
 ```text
-JSONL + CSV
-    |
-    v
-Python validation / normalization
-    |
-    +--> rejected records
-    |
-    +--> reference tables
-    |
-    +--> normalized events
-    |
-    v
-Snowflake
-    |
-    v
-WORK_ORDER_SUMMARY
-    |
-    v
-Analytical views
+EVENT_ID
+   |
+   +-- version 1: UPDATED_AT = 10:00
+   |
+   +-- version 2: UPDATED_AT = 12:00  <-- retained
+   |
+   +-- version 3: UPDATED_AT = 11:00
 ```
 
-## 4. Production hourly ingestion
-
-An Airflow/MWAA DAG runs the ingestion approximately once per hour.
-
-A production run should:
-
-1. Read the persisted API checkpoint.
-2. Request the next API page.
-3. Validate and normalize the response.
-4. Load the valid records into Snowflake.
-5. Capture invalid records without failing the entire batch.
-6. Commit the Snowflake transaction.
-7. Advance the checkpoint only after the load succeeds.
-8. Continue pagination until the required page/window is exhausted.
-9. Record run statistics and operational metrics.
-
-The checkpoint must never advance before the corresponding data is successfully committed.
-
-## 5. Pagination and checkpoints
-
-The API may expose page numbers, cursors, timestamps, or another continuation token.
-
-The ingestion state should persist at least:
+The ordering is:
 
 ```text
-source/system
-checkpoint or watermark
-pagination cursor
-last successful run
-run identifier
+UPDATED_AT_UTC DESC
+PAYLOAD_HASH DESC
 ```
 
-For timestamp-based APIs, use a small overlap window when necessary to protect against late-arriving records. Event-level idempotency prevents duplicate delivery from creating duplicate target rows.
+The selected canonical version is merged into `WORK_ORDER_EVENTS`.
 
-For cursor-based APIs, persist the cursor only after the page has been successfully loaded.
+An existing event is updated only when the incoming version is newer, or when the timestamp is equal and the deterministic payload hash differs.
 
-## 6. Retry and rate-limit handling
+### 5. Batch idempotency
 
-Transient API failures should use bounded retries with exponential backoff.
-
-Typical retry candidates include:
-
-- HTTP 429
-- HTTP 500
-- HTTP 502
-- HTTP 503
-- HTTP 504
-- network timeouts
-
-If the API supplies `Retry-After`, respect it.
-
-Retries should be bounded so a permanently unavailable source does not hold the orchestration slot indefinitely.
-
-Authentication failures and malformed requests should generally be treated as non-transient and surfaced immediately.
-
-## 7. Idempotency and correction handling
-
-The solution uses two complementary controls.
-
-### Batch-level idempotency
-
-A deterministic checksum identifies the source batch:
+Before loading, the implementation creates a SHA-256 checksum from the sorted source filenames and their complete contents.
 
 ```text
+source files
+     |
+     v
+SHA-256
+     |
+     v
 SOURCE_CHECKSUM
+     |
+     v
+INGESTION_RUNS
+     |
+  already exists?
+    /       \
+  yes       no
+   |         |
+ skip      process
 ```
 
-`INGESTION_RUNS` records the processed batch and prevents the same completed source batch from being processed repeatedly.
+This prevents replaying the exact same source batch.
 
-### Event-level idempotency
+---
 
-`EVENT_ID` is the event business key.
+# Productionized hourly architecture
 
-When the same event arrives again with a newer `UPDATED_AT`, the newer version wins.
-
-When update timestamps are equal, the payload hash provides deterministic tie-breaking.
-
-This handles:
-
-- retries
-- duplicate API delivery
-- corrected event payloads
-- overlapping extraction windows
-
-## 8. Reference data
-
-Stores and technicians are treated as first-class Snowflake reference tables:
+The assessment asks us to assume that production runs hourly and that the source becomes a paginated REST API.
 
 ```text
-STORES
-TECHNICIANS
+                         ┌───────────────────────┐
+                         │ Git / CI/CD           │
+                         │ versioned code + SQL  │
+                         └───────────┬───────────┘
+                                     |
+                                     v
+┌─────────────────────────────────────────────────────────┐
+│ Airflow / MWAA                                          │
+│                                                         │
+│ Hourly DAG                                              │
+│  ├── load credentials/connections                       │
+│  ├── read checkpoint                                    │
+│  ├── call API                                            │
+│  ├── retry / backoff / rate-limit handling              │
+│  ├── persist page                                        │
+│  ├── advance checkpoint after success                   │
+│  └── publish run metrics / alert on failure             │
+└──────────────────────────┬──────────────────────────────┘
+                           |
+                           v
+                ┌─────────────────────┐
+                │ Paginated REST API  │
+                └──────────┬──────────┘
+                           |
+                  next-page / cursor
+                           |
+                           v
+                ┌─────────────────────┐
+                │ Python + Snowpark   │
+                │                     │
+                │ Parse               │
+                │ Normalize           │
+                │ Validate            │
+                │ Reference checks    │
+                │ Deduplicate         │
+                │ Reject invalid rows │
+                └──────────┬──────────┘
+                           |
+                           v
+                ┌─────────────────────┐
+                │ Snowflake           │
+                │                     │
+                │ INGESTION_RUNS      │
+                │ REJECTED_RECORDS    │
+                │ WORK_ORDER_EVENTS   │
+                │ STORES              │
+                │ TECHNICIANS         │
+                └──────────┬──────────┘
+                           |
+                           v
+                ┌─────────────────────┐
+                │ Snowflake SQL       │
+                │                     │
+                │ WORK_ORDER_SUMMARY  │
+                │ ANALYSIS_*          │
+                └──────────┬──────────┘
+                           |
+                           v
+                    BI / consumers
 ```
 
-The Python ingestion process uses these datasets to validate event references.
+## Production design by requirement
 
-The production API version should either:
+### 1. Incremental processing / checkpoints
 
-- ingest reference data through the same controlled pipeline, or
-- source it from an authoritative master-data system.
+Persist the API cursor, page token, or source watermark in durable control metadata.
 
-Reference loads should remain idempotent through `MERGE` operations.
+A checkpoint advances **only after the corresponding page/batch has been successfully persisted**.
 
-## 9. Error handling and dead-letter path
+This makes a failed run restartable without silently skipping data.
 
-A bad record should not cause an otherwise valid batch to fail.
+### 2. Pagination
 
-Examples:
+The Python API client loops over pages until no next-page token remains.
+
+For example:
 
 ```text
-Malformed JSON
-Missing event_id
-Missing work_order_id
-Invalid timestamp
-Unsupported event_type
-Invalid priority
-Negative labor
-Unknown store
-Unknown technician
+GET page 1
+   |
+persist successfully
+   |
+save checkpoint
+   |
+GET page 2
+   |
+persist successfully
+   |
+save checkpoint
+   |
+...
 ```
 
-The rejected-record path should retain:
+### 3. Retries / rate limits
+
+Use bounded exponential backoff for transient failures.
+
+Handle:
+
+- connection failures
+- HTTP 5xx
+- HTTP 429
+- `Retry-After`
+
+Do not retry permanent 4xx validation/authentication failures indefinitely.
+
+### 4. Authentication / secrets
+
+API and Snowflake credentials should be supplied through managed secrets/connections.
+
+No credentials should be committed to Git.
+
+A production Airflow/MWAA deployment can use an appropriate cloud secrets manager or Airflow connection backed by one.
+
+### 5. Duplicate prevention / idempotency
+
+Use multiple layers:
+
+```text
+checkpoint
+    +
+EVENT_ID
+    +
+UPDATED_AT
+    +
+PAYLOAD_HASH
+    +
+Snowflake MERGE
+```
+
+A replayed API page therefore does not create duplicate canonical events.
+
+### 6. Failure recovery
+
+Use page/batch-level restartability.
+
+The sequence should be:
+
+```text
+read checkpoint
+      |
+fetch page
+      |
+validate/load
+      |
+successful commit
+      |
+advance checkpoint
+```
+
+Never advance the checkpoint before the corresponding data is safely persisted.
+
+### 7. Logging / monitoring / alerting
+
+Capture at minimum:
 
 ```text
 run_id
-source
-source row / record identifier
-rejection reason
-raw payload
-rejected timestamp
+start/end time
+checkpoint
+pages requested
+records received
+records accepted
+records rejected
+duplicates/corrections
+API failures
+processing duration
 ```
 
-This provides traceability without silently discarding bad data.
+Alert on failed DAG runs and sustained source/data-quality problems.
 
-## 10. Snowflake responsibilities
+### 8. Orchestration / scheduling
 
-Snowflake is responsible for:
+Use Airflow/MWAA for the hourly workflow.
 
-### Raw/normalized event storage
+Benefits include:
 
-`WORK_ORDER_EVENTS`
+- scheduling
+- retry policies
+- task dependencies
+- run history
+- operational visibility
+- connection/secret integration
 
-One row represents the current valid version of an event at `EVENT_ID` grain.
+### 9. Deployment / version control
 
-### Reference data
+Git is the source of truth.
 
-```text
-STORES
-TECHNICIANS
-```
+CI should validate:
 
-### Ingestion audit
+- Python compilation
+- dependencies
+- required source/migration files
+- Flyway migration set
+- ingestion dry run
 
-`INGESTION_RUNS`
+Production should deploy a specific Git revision.
 
-Stores batch-level statistics and source identity.
+### 10. Python vs Snowflake SQL vs cloud services
 
-### Rejections
+| Requirement | Technology |
+|---|---|
+| REST API client | Python |
+| Pagination | Python |
+| Retry/backoff | Python |
+| API checkpoint handling | Python + Snowflake control metadata |
+| JSON normalization | Snowpark |
+| Record validation | Snowpark |
+| Reference validation | Snowpark / Snowflake |
+| Canonical merge | Snowflake SQL |
+| Work-order summary | Snowflake SQL |
+| Analytics | Snowflake SQL |
+| Hourly scheduling | Airflow / MWAA |
+| Secrets | Cloud secrets manager / Airflow connections |
+| CI/CD | GitHub Actions |
 
-`REJECTED_RECORDS`
+## Production improvements beyond the assessment
 
-Stores records that could not be normalized or validated.
+The current implementation is intentionally compact. Before production, I would additionally introduce:
 
-### Curated work-order model
+1. Explicit ingestion run states such as `STARTED`, `SUCCEEDED`, and `FAILED`.
+2. Durable API cursor/watermark checkpoints.
+3. Automated unit tests for parsing and validation.
+4. Integration tests against a controlled Snowflake environment.
+5. Centralized structured logging and metrics.
+6. Alerting integrated with the production incident channel.
+7. Least-privilege Snowflake roles and stage permissions.
+8. Secret rotation through the cloud secret manager.
+9. Controlled deployment/promotion of Python and Flyway migrations.
+10. Replay tooling for rejected records after data-quality correction.
 
-`WORK_ORDER_SUMMARY`
-
-Provides one row per work order for downstream analytics.
-
-### Analytics
-
-Separate analytical views answer the assessment questions without embedding those calculations into the ingestion process.
-
-## 11. Observability
-
-Production monitoring should capture at least:
-
-### Pipeline metrics
-
-- run success/failure
-- run duration
-- records received
-- records accepted
-- records rejected
-- duplicate count
-- correction count
-- records loaded
-- API request count
-
-### Data-quality metrics
-
-- rejection percentage
-- unknown-reference count
-- unsupported-event count
-- invalid timestamp count
-- negative-labor count
-- unexpected event-sequence count
-
-### Operational metrics
-
-- API latency
-- API rate-limit responses
-- retry count
-- checkpoint age
-- Snowflake load duration
-- Snowflake failures
-
-### Alerts
-
-Alert on:
-
-- failed ingestion runs
-- stale checkpoints
-- sustained API failures
-- rejection spikes
-- unexpected correction spikes
-- significant volume drops
-- Snowflake load failures
-
-## 12. Security
-
-Production credentials must not be stored in the repository.
-
-Use a secret-management mechanism such as:
-
-```text
-AWS Secrets Manager
-```
-
-or the organization's approved equivalent.
-
-Credentials should be injected into the runtime environment.
-
-Access should follow least privilege:
-
-- ingestion identity can write required Snowflake tables
-- analytical consumers receive read access to curated objects
-- administrative Flyway permissions are separated from normal ingestion permissions where practical
-
-Sensitive columns should use the organization's Snowflake security controls where required.
-
-## 13. CI/CD
-
-The repository should use separate concerns for validation and deployment.
-
-### CI
-
-```text
-Pull request
-    |
-    +--> Python compilation / static validation
-    |
-    +--> Flyway migration file validation
-    |
-    +--> repository checks
-```
-
-### Deployment
-
-```text
-Approved merge
-    |
-    v
-Deployment workflow
-    |
-    +--> authenticate to Snowflake
-    |
-    +--> run Flyway migrations
-    |
-    +--> validate migration state
-    |
-    +--> execute ingestion
-    |
-    v
-Operational monitoring
-```
-
-Flyway migrations remain versioned and ordered. The current repository uses V001 through V010; repeatable `R__*.sql` migrations are intentionally not required.
-
-## 14. Failure recovery
-
-The design supports recovery without manually reconstructing data.
-
-### API failure
-
-Retry transient failures. If the run ultimately fails, retain the previous successful checkpoint and retry on the next scheduled run.
-
-### Snowflake failure
-
-Do not advance the source checkpoint until the transaction succeeds.
-
-The same source window can therefore be replayed safely because event-level idempotency prevents duplicate target records.
-
-### Bad records
-
-Continue processing valid records and retain invalid records in the rejection path.
-
-### Partial orchestration failure
-
-Use the persisted checkpoint and event-level `MERGE` logic to safely resume.
-
-## 15. Python vs. Snowflake responsibilities
-
-| Responsibility | Python | Snowflake |
-|---|---|---|
-| REST API calls | Yes | No |
-| Pagination | Yes | No |
-| API retries/rate limits | Yes | No |
-| Source parsing | Yes | No |
-| Record validation | Yes | Some downstream validation |
-| Timestamp normalization | Yes | Possible |
-| Reference checks | Yes | Possible |
-| Rejection capture | Yes | Storage |
-| Event correction handling | Coordinates | `MERGE` target |
-| Durable event storage | No | Yes |
-| Curated work-order model | No | Yes |
-| Analytical aggregations | No | Yes |
-| BI/query consumption | No | Yes |
-
-This boundary keeps external-system concerns out of Snowflake while allowing Snowflake to perform set-based transformations and analytics efficiently.
+The assessment implementation therefore provides the core ingestion/data-quality model while leaving the operational platform concerns to the production orchestration layer.
