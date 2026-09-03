@@ -151,10 +151,10 @@ def process_events(session: Session, stage: str, run_id: str) -> dict:
         """
     ).collect()
 
-    # 1. Bypass DataFrame subquery limits using a Temporary View to grab Metadata
+    # 1. Bypass DataFrame subquery limits using a Temporary Table to materialize Metadata
     session.sql(
         f"""
-        CREATE OR REPLACE TEMPORARY VIEW STG_RAW_EVENTS AS
+        CREATE OR REPLACE TEMPORARY TABLE STG_RAW_EVENTS AS
         SELECT 
             METADATA$FILENAME AS SOURCE_FILE,
             METADATA$FILE_ROW_NUMBER AS SOURCE_ROW_NUMBER,
@@ -163,6 +163,8 @@ def process_events(session: Session, stage: str, run_id: str) -> dict:
         WHERE $1 IS NOT NULL
         """
     ).collect()
+
+    # df = session.table("STG_RAW_EVENTS")
 
     df = session.table("STG_RAW_EVENTS")
 
