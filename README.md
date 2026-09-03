@@ -23,7 +23,7 @@ Run tests with `python -m unittest discover --start-directory tests --top-level-
 
 ## Flyway script layout
 
-Every physical table has its own versioned `V###__*.sql` migration. Flyway records each one once in `WORK.FLYWAY_SCHEMA_HISTORY`. Procedures and views use `R__*.sql` repeatable migrations: Flyway re-applies them whenever their file checksum changes. Deployment migrates first, validates the resulting state, then ingests source data. Do not rename or edit a versioned migration after it has run in a shared environment; add a new versioned migration instead.
+Every physical table has its own versioned `V###__*.sql` migration. Flyway records each one once in `WORK.FLYWAY_SCHEMA_HISTORY`. Procedures and views use numerically ordered `R__###_*.sql` repeatable migrations: Flyway re-applies them whenever their file checksum changes. The ordering creates `WORK_ORDER_SUMMARY` before the analysis views that depend on it. Deployment migrates first, validates the resulting state, then ingests source data. Do not rename or edit a versioned migration after it has run in a shared environment; add a new versioned migration instead.
 
 ## Validation and assumptions
 
@@ -42,3 +42,5 @@ See [architecture.md](architecture.md) for the production design.
 ## GitHub deployment prerequisites
 
 The supplied source files are versioned under `data/source`, so the workflow runs on a GitHub-hosted Ubuntu runner and needs no manual path input. The runner needs outbound HTTPS access to GitHub, Snowflake, and the Flyway download endpoint. Add the Snowflake secrets listed in the deployment documentation to the `Development` GitHub environment. The workflow installs Python dependencies and Flyway, checks the Snowflake connection with `flyway info`, applies migrations, and only then starts ingestion.
+
+If a migration has failed, inspect the failed statement before retrying. The manual deployment input `repair_failed_migration` is `false` by default. Set it to `true` only after confirming that the failed statement did not leave a partial database object; it runs `flyway repair` to remove the failed entry from Flyway history before retrying migration.
