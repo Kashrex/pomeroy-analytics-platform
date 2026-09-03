@@ -3,35 +3,37 @@ Snowpark implementation of the Pomeroy ingestion flow with full functional parit
 
 This version implements:
 - Batch Idempotency via INGESTION_RUNS.
-- Source tracking via Snowflake metadata columns.
+- Source tracking via Snowflake metadata columns (using a Temp View bypass).
 - Referential integrity checks against loaded reference data.
 - Split-stream routing to write failed records to REJECTED_RECORDS.
+- Caching to prevent lazy-evaluation recomputation.
+- Safe JSON parsing, timestamp 'Z' handling, and deterministic hashing.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import logging
 import os
 import uuid
-import logging
 from pathlib import Path
 
 from snowflake.snowpark import Session
 from snowflake.snowpark.functions import (
     col,
-    count,
-    current_timestamp,
     is_null,
     lit,
+    replace,
     row_number,
     sha2,
+    to_json,
     to_timestamp_tz,
     try_parse_json,
     upper,
     when,
 )
-from snowflake.snowpark.types import StructType, StructField, StringType
+from snowflake.snowpark.types import IntegerType, StringType, StructField, StructType
 from snowflake.snowpark.window import Window
 
 VALID_EVENT_TYPES = [
@@ -54,9 +56,7 @@ def create_session() -> Session:
 
     missing = [name for name, value in required.items() if not value]
     if missing:
-        raise RuntimeError(
-            "Missing Snowflake environment variables: " + ", ".join(missing)
-        )
+        raise RuntimeError("Missing Snowflake environment variables: " + ", ".join(missing))
 
     connection_parameters = {
         "account": required["SNOWFLAKE_ACCOUNT"],
@@ -151,36 +151,42 @@ def process_events(session: Session, stage: str, run_id: str) -> dict:
         """
     ).collect()
 
-    # 1. Read Raw Strings and Metadata
-    raw_df = session.read.option("FORMAT_NAME", raw_format).csv(f"@{stage}/events/")
-    df = session.sql(
+    # 1. Bypass DataFrame subquery limits using a Temporary View to grab Metadata
+    session.sql(
         f"""
+        CREATE OR REPLACE TEMPORARY VIEW STG_RAW_EVENTS AS
         SELECT 
             METADATA$FILENAME AS SOURCE_FILE,
             METADATA$FILE_ROW_NUMBER AS SOURCE_ROW_NUMBER,
             $1 AS RAW_PAYLOAD_STRING
         FROM @{stage}/events/ (FORMAT_NAME => '{raw_format}')
+        WHERE $1 IS NOT NULL
         """
-    ).filter(col("RAW_PAYLOAD_STRING").is_not_null())  # Drop blank lines
+    ).collect()
+
+    df = session.table("STG_RAW_EVENTS")
 
     # 2. Parse JSON safely
     df = df.with_column("PAYLOAD", try_parse_json(col("RAW_PAYLOAD_STRING")))
 
-    # 3. Extract Fields
+    # 3. Extract Fields with explicit Types to strip Variant quotes and fix Z suffix
     df = df.select(
-        "*",
-        col("PAYLOAD")["event_id"].cast("string").alias("EVENT_ID"),
-        col("PAYLOAD")["work_order_id"].cast("string").alias("WORK_ORDER_ID"),
-        col("PAYLOAD")["client_id"].cast("string").alias("CLIENT_ID"),
-        upper(col("PAYLOAD")["event_type"].cast("string")).alias("EVENT_TYPE"),
-        col("PAYLOAD")["event_timestamp"].cast("string").alias("EVENT_TIMESTAMP_RAW"),
-        col("PAYLOAD")["updated_at"].cast("string").alias("UPDATED_AT_RAW"),
-        upper(col("PAYLOAD")["priority"].cast("string")).alias("PRIORITY"),
-        col("PAYLOAD")["technician"]["id"].cast("string").alias("TECHNICIAN_ID"),
-        col("PAYLOAD")["location"]["store_id"].cast("string").alias("STORE_ID"),
-        col("PAYLOAD")["location"]["region"].cast("string").alias("REGION"),
-        col("PAYLOAD")["labor"]["minutes"].cast("integer").alias("LABOR_MINUTES"),
-        col("PAYLOAD")["source"].cast("string").alias("SOURCE_SYSTEM")
+        col("SOURCE_FILE"),
+        col("SOURCE_ROW_NUMBER"),
+        col("RAW_PAYLOAD_STRING"),
+        col("PAYLOAD"),
+        col("PAYLOAD")["event_id"].cast(StringType()).alias("EVENT_ID"),
+        col("PAYLOAD")["work_order_id"].cast(StringType()).alias("WORK_ORDER_ID"),
+        col("PAYLOAD")["client_id"].cast(StringType()).alias("CLIENT_ID"),
+        upper(col("PAYLOAD")["event_type"].cast(StringType())).alias("EVENT_TYPE"),
+        replace(col("PAYLOAD")["event_timestamp"].cast(StringType()), lit("Z"), lit("+00:00")).alias("EVENT_TIMESTAMP_RAW"),
+        replace(col("PAYLOAD")["updated_at"].cast(StringType()), lit("Z"), lit("+00:00")).alias("UPDATED_AT_RAW"),
+        upper(col("PAYLOAD")["priority"].cast(StringType())).alias("PRIORITY"),
+        col("PAYLOAD")["technician"]["id"].cast(StringType()).alias("TECHNICIAN_ID"),
+        col("PAYLOAD")["location"]["store_id"].cast(StringType()).alias("STORE_ID"),
+        col("PAYLOAD")["location"]["region"].cast(StringType()).alias("REGION"),
+        col("PAYLOAD")["labor"]["minutes"].cast(IntegerType()).alias("LABOR_MINUTES"),
+        col("PAYLOAD")["source"].cast(StringType()).alias("SOURCE_SYSTEM")
     )
 
     # 4. Reference Lookups
@@ -207,9 +213,11 @@ def process_events(session: Session, stage: str, run_id: str) -> dict:
         .otherwise(None)
     )
 
-    # 6. Split Streams
-    rejected_df = df.filter(col("REJECT_REASON").is_not_null())
-    accepted_df = df.filter(col("REJECT_REASON").is_null())
+    # 6. Cache Result to prevent 4x re-execution of the joins and JSON parsing
+    cached_df = df.cache_result()
+
+    rejected_df = cached_df.filter(col("REJECT_REASON").is_not_null())
+    accepted_df = cached_df.filter(col("REJECT_REASON").is_null())
 
     # Write Rejects
     rejects_to_write = rejected_df.select(
@@ -225,12 +233,19 @@ def process_events(session: Session, stage: str, run_id: str) -> dict:
     # 7. Deduplicate Accepted
     accepted_df = accepted_df.with_column("EVENT_TIMESTAMP_UTC", to_timestamp_tz(col("EVENT_TIMESTAMP_RAW")))
     accepted_df = accepted_df.with_column("UPDATED_AT_UTC", to_timestamp_tz(col("UPDATED_AT_RAW")))
-    accepted_df = accepted_df.with_column("PAYLOAD_HASH", sha2(col("RAW_PAYLOAD_STRING"), 256))
+    
+    # Hash predictably using to_json instead of the raw whitespace-sensitive string
+    accepted_df = accepted_df.with_column("PAYLOAD_HASH", sha2(to_json(col("PAYLOAD")), 256))
 
     window = Window.partition_by("EVENT_ID").order_by(col("UPDATED_AT_UTC").desc(), col("PAYLOAD_HASH").desc())
     deduped_df = accepted_df.with_column("_RN", row_number().over(window)).filter(col("_RN") == 1).drop("_RN")
     
-    return {"deduped_df": deduped_df, "accepted_count": accepted_df.count(), "unique_count": deduped_df.count(), "reject_count": reject_count}
+    return {
+        "deduped_df": deduped_df, 
+        "accepted_count": accepted_df.count(), 
+        "unique_count": deduped_df.count(), 
+        "reject_count": reject_count
+    }
 
 
 def load_events(session: Session, events_df, run_id: str) -> None:
@@ -282,7 +297,7 @@ def main() -> None:
 
     try:
         # Idempotency Check
-        existing_run = session.table("INGESTION_RUNS").filter(col("SOURCE_CHECKSUM") == checksum).collect()
+        existing_run = session.table("INGESTION_RUNS").filter(col("SOURCE_CHECKSUM") == checksum).limit(1).collect()
         if existing_run:
             LOGGER.info("source checksum already loaded; skipping event load")
             return
