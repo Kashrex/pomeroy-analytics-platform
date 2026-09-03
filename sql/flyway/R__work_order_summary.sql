@@ -1,4 +1,3 @@
--- Must run before repeatable analysis views.
 CREATE OR REPLACE VIEW WORK_ORDER_SUMMARY AS
 WITH per_work_order AS (
   SELECT work_order_id,

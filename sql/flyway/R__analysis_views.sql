@@ -1,4 +1,3 @@
--- Depends on WORK_ORDER_SUMMARY (R__010).
 CREATE OR REPLACE VIEW ANALYSIS_TECHNICIAN_CLOSE_RANK AS
 SELECT technician_id, COUNT(*) AS closed_work_order_count,
        DENSE_RANK() OVER (ORDER BY COUNT(*) DESC) AS close_rank
