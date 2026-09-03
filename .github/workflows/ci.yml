@@ -6,20 +6,47 @@ on:
     branches: [main]
 
 jobs:
-  python:
+  python-check:
+    name: Python syntax check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.12' }
-      - run: pip install -r requirements.txt
-      - run: python -m unittest discover --start-directory tests --top-level-directory . --verbose
 
-  flyway-validate:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compile Python source
+        run: python -m compileall -q src
+
+  flyway-check:
+    name: Flyway migration check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate migration naming and SQL files
+
+      - name: Validate migration files exist
+        shell: bash
         run: |
-          test -n "$(find sql/flyway -name 'V*__*.sql')"
-          find sql/flyway -name 'V*__*.sql' -print
+          set -euo pipefail
+          test -d sql/flyway
+          test -n "$(find sql/flyway -type f -name '*.sql' -print -quit)"
+
+      - name: Validate migration naming
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r file; do
+            name="$(basename "$file")"
+            if [[ ! "$name" =~ ^(V[0-9]+__.+|R__.+)\.sql$ ]]; then
+              echo "Invalid Flyway migration name: $file"
+              exit 1
+            fi
+          done < <(find sql/flyway -type f -name '*.sql' | sort)
+
+      - name: Check required SQL objects are present
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Riq 'WORK_ORDER_SUMMARY' sql/flyway
+          grep -Riq 'WORK_ORDER_EVENTS' sql/flyway

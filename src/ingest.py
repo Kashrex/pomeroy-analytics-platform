@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -183,30 +183,6 @@ def source_checksum(paths: list[Path]) -> str:
     return digest.hexdigest()
 
 
-def write_outputs(output_dir: Path, events: list[Event], rejects: list[Reject], stats: dict[str, Any]) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    fields = [
-        "event_id", "work_order_id", "client_id", "event_type", "event_timestamp_utc",
-        "updated_at_utc", "priority", "technician_id", "store_id", "region", "labor_minutes",
-        "source_system", "source_file", "source_row_number", "payload_hash",
-    ]
-    with (output_dir / "normalized_events.csv").open("w", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fields)
-        writer.writeheader()
-        for event in sorted(events, key=lambda x: x.event_id):
-            row = asdict(event)
-            row.pop("payload")
-            row["event_timestamp_utc"] = event.event_timestamp_utc.isoformat()
-            row["updated_at_utc"] = event.updated_at_utc.isoformat()
-            writer.writerow(row)
-
-    with (output_dir / "rejected_records.jsonl").open("w", encoding="utf-8") as fh:
-        for reject in rejects:
-            fh.write(json.dumps(asdict(reject), ensure_ascii=False) + "\n")
-
-    (output_dir / "processing_stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
-
-
 def snowflake_connection():
     from snowflake.connector import connect
 
@@ -307,8 +283,7 @@ def load_to_snowflake(events: list[Event], rejects: list[Reject], checksum: str)
 def main() -> None:
     parser = argparse.ArgumentParser(description="Validate, normalize and load work-order events.")
     parser.add_argument("--source-dir", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, default=Path("output"))
-    parser.add_argument("--dry-run", action="store_true", help="Process and write outputs without loading Snowflake")
+    parser.add_argument("--dry-run", action="store_true", help="Validate and normalize without loading Snowflake")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -333,7 +308,6 @@ def main() -> None:
         "technicians": len(technicians),
         "source_checksum": checksum,
     }
-    write_outputs(args.output_dir, current, rejects, stats)
     logging.info("processing statistics: %s", json.dumps(stats, sort_keys=True))
 
     if not args.dry_run:
