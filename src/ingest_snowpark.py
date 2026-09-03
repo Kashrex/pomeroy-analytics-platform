@@ -235,8 +235,23 @@ def load_reference_tables(session: Session, stage: str) -> None:
 
 
 def read_events(session: Session, stage: str):
-    """Read staged JSONL files as Snowpark VARIANT rows."""
+    """
+    Load staged JSONL files into a staging table as VARIANT rows.
+
+    NOTE: session.read.json(...) compiles to a plain SELECT against the
+    staged files, and Snowflake's JSON parser has no per-record error
+    tolerance in a SELECT -- a single malformed JSON line anywhere in a
+    file (e.g. a missing colon) raises SnowparkSQLException and aborts the
+    entire read.
+
+    COPY INTO, by contrast, is a load operation and does support
+    ON_ERROR = 'CONTINUE', which skips individual malformed records
+    instead of failing the whole batch. We therefore stage the raw
+    payloads into a temporary table via COPY INTO rather than querying
+    the files directly.
+    """
     json_format = "POMEROY_JSON_FORMAT"
+    staging_table = "STG_RAW_EVENTS"
 
     session.sql(
         f"""
@@ -246,7 +261,46 @@ def read_events(session: Session, stage: str):
         """
     ).collect()
 
-    return session.read.json(f"@{stage}/events/")
+    session.sql(
+        f"""
+        CREATE TEMPORARY TABLE IF NOT EXISTS {staging_table} (
+            PAYLOAD VARIANT
+        )
+        """
+    ).collect()
+
+    # Guard against leftover rows if the session/table is reused.
+    session.sql(f"TRUNCATE TABLE {staging_table}").collect()
+
+    copy_results = session.sql(
+        f"""
+        COPY INTO {staging_table} (PAYLOAD)
+        FROM (SELECT $1 FROM @{stage}/events/)
+        FILE_FORMAT = (FORMAT_NAME = {json_format})
+        ON_ERROR = 'CONTINUE'
+        PURGE = FALSE
+        """
+    ).collect()
+
+    total_rows_loaded = 0
+    total_rows_parsed = 0
+    for row in copy_results:
+        row_dict = row.as_dict()
+        print(f"COPY INTO status: {row_dict}")
+        total_rows_loaded += row_dict.get("rows_loaded") or 0
+        total_rows_parsed += row_dict.get("rows_parsed") or 0
+
+    skipped = total_rows_parsed - total_rows_loaded
+    if skipped:
+        print(
+            f"Warning: {skipped} malformed JSON record(s) were skipped "
+            f"during load (rows_parsed={total_rows_parsed}, "
+            f"rows_loaded={total_rows_loaded}). Individual rejection "
+            f"reasons are not captured per-record in this Snowpark path; "
+            f"use src/ingest.py if that level of detail is required."
+        )
+
+    return session.table(staging_table)
 
 
 def normalize_events(session: Session, raw_df):
@@ -259,7 +313,7 @@ def normalize_events(session: Session, raw_df):
       technician.id, location.store_id, location.region,
       labor.minutes
     """
-    df = raw_df.select(col("$1").alias("PAYLOAD"))
+    df = raw_df.select(col("PAYLOAD"))
 
     normalized = df.select(
         col("PAYLOAD")["event_id"].cast("string").alias("EVENT_ID"),
