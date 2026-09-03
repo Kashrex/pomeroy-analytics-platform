@@ -21,6 +21,10 @@ Run tests with `python -m unittest discover --start-directory tests --top-level-
 - Gold is the `WORK_ORDER_SUMMARY` view. Its grain is exactly one `WORK_ORDER_ID`.
 - `INGESTION_RUNS` records each batch. A completed identical source checksum is skipped; the Silver merge is also deterministic, so correction replays cannot create duplicate current events.
 
+## Flyway script layout
+
+Every physical table has its own versioned `V###__*.sql` migration. Flyway records each one once in `WORK.FLYWAY_SCHEMA_HISTORY`. Procedures and views use `R__*.sql` repeatable migrations: Flyway re-applies them whenever their file checksum changes. Deployment has three separate workflow steps: validate scripts, execute `flyway migrate`, then ingest source data. Do not rename or edit a versioned migration after it has run in a shared environment; add a new versioned migration instead.
+
 ## Validation and assumptions
 
 - Required event fields: event ID, work-order ID, client ID, event type, event timestamp, and update timestamp.

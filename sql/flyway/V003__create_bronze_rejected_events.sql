@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS BRONZE_REJECTED_EVENTS (
+    rejection_id NUMBER AUTOINCREMENT,
+    run_id STRING NOT NULL, source_file STRING NOT NULL, source_row_number NUMBER NOT NULL,
+    rejection_reason STRING NOT NULL, raw_payload VARIANT,
+    rejected_at TIMESTAMP_TZ NOT NULL DEFAULT CURRENT_TIMESTAMP()
+);
