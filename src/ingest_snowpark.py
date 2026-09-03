@@ -151,14 +151,24 @@ def process_events(session: Session, stage: str, run_id: str) -> dict:
         """
     ).collect()
 
-    # 1. Bypass DataFrame subquery limits using a Temporary Table to materialize Metadata
+    # 1. Define the table explicitly, then insert to bypass stage CTAS limitations
+    session.sql(
+        """
+        CREATE OR REPLACE TEMPORARY TABLE STG_RAW_EVENTS (
+            SOURCE_FILE STRING,
+            SOURCE_ROW_NUMBER NUMBER,
+            RAW_PAYLOAD_STRING STRING
+        )
+        """
+    ).collect()
+
     session.sql(
         f"""
-        CREATE OR REPLACE TEMPORARY TABLE STG_RAW_EVENTS AS
+        INSERT INTO STG_RAW_EVENTS (SOURCE_FILE, SOURCE_ROW_NUMBER, RAW_PAYLOAD_STRING)
         SELECT 
-            METADATA$FILENAME AS SOURCE_FILE,
-            METADATA$FILE_ROW_NUMBER AS SOURCE_ROW_NUMBER,
-            $1 AS RAW_PAYLOAD_STRING
+            METADATA$FILENAME,
+            METADATA$FILE_ROW_NUMBER,
+            $1
         FROM @{stage}/events/ (FORMAT_NAME => '{raw_format}')
         WHERE $1 IS NOT NULL
         """
