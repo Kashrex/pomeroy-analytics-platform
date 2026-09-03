@@ -1,26 +1,40 @@
 name: CI
+
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+
 jobs:
   validate:
+    name: Validate
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
       - name: Compile Python
-        run: python -m compileall -q src
-            - name: Validate Flyway files
-        run:
+        run: |
+          python -m compileall -q src
+
+      - name: Validate Flyway configuration
+        run: |
           test -f flyway.toml
+
+      - name: Validate Flyway migrations
+        run: |
           for file in \
             sql/flyway/V001__create_ingestion_runs.sql \
             sql/flyway/V002__create_WORK_ORDER_EVENTS.sql \
@@ -33,5 +47,33 @@ jobs:
             sql/flyway/V009__create_stores.sql \
             sql/flyway/V010__create_technicians.sql
           do
+            echo "Checking $file"
             test -f "$file"
           done
+
+      - name: Ensure no repeatable Flyway migrations
+        run: |
+          if find sql/flyway -maxdepth 1 -type f -name 'R__*.sql' -print -quit | grep -q .; then
+            echo "Repeatable Flyway migrations (R__*.sql) are not allowed."
+            find sql/flyway -maxdepth 1 -type f -name 'R__*.sql' -print
+            exit 1
+          fi
+
+      - name: Validate source files
+        run: |
+          for file in \
+            data/source/stores.csv \
+            data/source/technicians.csv \
+            data/source/work_order_events_01.jsonl \
+            data/source/work_order_events_02.jsonl \
+            data/source/work_order_events_03.jsonl
+          do
+            echo "Checking $file"
+            test -f "$file"
+          done
+
+      - name: Validate ingestion dry run
+        run: |
+          python -m src.ingest \
+            --source-dir data/source \
+            --dry-run
