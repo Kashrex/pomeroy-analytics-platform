@@ -6,7 +6,7 @@ on:
 jobs:
   migrate-and-ingest:
     runs-on: ubuntu-latest
-    environment: production
+    environment: Development
     permissions:
       contents: read
     steps:

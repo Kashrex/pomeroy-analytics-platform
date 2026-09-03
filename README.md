@@ -41,4 +41,4 @@ See [architecture.md](architecture.md) for the production design.
 
 ## GitHub deployment prerequisites
 
-The supplied source files are versioned under `data/source`, so the workflow runs on a GitHub-hosted Ubuntu runner and needs no manual path input. The runner needs outbound HTTPS access to GitHub, Snowflake, and the Flyway download endpoint. Add the Snowflake secrets listed in the deployment documentation to the `production` GitHub environment. The workflow installs Python dependencies and Flyway, checks the Snowflake connection with `flyway info`, applies migrations, and only then starts ingestion.
+The supplied source files are versioned under `data/source`, so the workflow runs on a GitHub-hosted Ubuntu runner and needs no manual path input. The runner needs outbound HTTPS access to GitHub, Snowflake, and the Flyway download endpoint. Add the Snowflake secrets listed in the deployment documentation to the `Development` GitHub environment. The workflow installs Python dependencies and Flyway, checks the Snowflake connection with `flyway info`, applies migrations, and only then starts ingestion.
