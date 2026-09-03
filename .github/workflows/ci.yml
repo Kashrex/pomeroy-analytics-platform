@@ -18,15 +18,21 @@ jobs:
         run: pip install -r requirements.txt
       - name: Compile Python
         run: python -m compileall -q src
-      - name: Validate Flyway files
+            - name: Validate Flyway files
         run: |
           test -f flyway.toml
+
           for file in \
-            sql/flyway/V001__create_work_tables.sql \
-            sql/flyway/V002__create_work_order_summary.sql \
-            sql/flyway/V003__create_analysis_technician_close_rank.sql \
-            sql/flyway/V004__create_analysis_reopen_rate.sql \
-            sql/flyway/V005__create_analysis_weekly_completed.sql \
-            sql/flyway/V006__create_analysis_abnormal_sequences.sql; do
+            sql/flyway/V001__create_ingestion_runs.sql \
+            sql/flyway/V002__create_WORK_ORDER_EVENTS.sql \
+            sql/flyway/V003__create_REJECTED_RECORDS.sql \
+            sql/flyway/V004__create_work_order_summary.sql \
+            sql/flyway/V005__create_analysis_technician_close_rank.sql \
+            sql/flyway/V006__create_analysis_reopen_rate.sql \
+            sql/flyway/V007__create_analysis_weekly_completed.sql \
+            sql/flyway/V008__create_analysis_abnormal_sequences.sql \
+            sql/flyway/V009__create_stores.sql \
+            sql/flyway/V010__create_technicians.sql
+          do
             test -f "$file"
           done
