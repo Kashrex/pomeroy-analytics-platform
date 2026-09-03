@@ -12,7 +12,7 @@ An assessment-sized Snowflake medallion implementation for work-order events. It
 
 Confirm access without changing data by running `python -m src.preflight`. The expected schema is `WORK`.
 
-Run tests with `pytest -q`.
+Run tests with `python -m unittest discover --start-directory tests --top-level-directory . --verbose`. No third-party test runner is required.
 
 ## Design decisions
 
