@@ -10,6 +10,8 @@ An assessment-sized Snowflake medallion implementation for work-order events. It
 4. Validate without loading: `python -m src.ingest --source-dir <source-files-directory> --dry-run`.
 5. Load: `python -m src.ingest --source-dir <source-files-directory>`.
 
+Confirm access without changing data by running `python -m src.preflight`. The expected schema is `WORK`.
+
 Run tests with `pytest -q`.
 
 ## Design decisions
@@ -32,3 +34,7 @@ Run tests with `pytest -q`.
 `ANALYSIS_ABNORMAL_SEQUENCES` flags missing opens, close-before-open, a reopen history ending in closed, and single-event work orders. The current file loader intentionally reads each input batch in memory; for large production volumes replace it with streaming staging uploads. Reference CSV history is type-1 only. Production should use key-pair/OAuth authentication, a secret manager, API cursor checkpoints, dead-letter retention policy, observability dashboards, and alert thresholds.
 
 See [architecture.md](architecture.md) for the production design.
+
+## GitHub deployment prerequisites
+
+The workflow runs on a self-hosted runner because it must access the source-file path provided at manual dispatch. The runner needs outbound HTTPS access to GitHub, Snowflake, and the Flyway download endpoint. Add the Snowflake secrets listed in the deployment documentation to the `production` GitHub environment. The workflow installs Python dependencies and Flyway, checks the Snowflake connection with `flyway info`, applies migrations, and only then starts ingestion.
