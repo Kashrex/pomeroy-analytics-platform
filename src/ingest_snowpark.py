@@ -14,7 +14,7 @@ Assumptions for this alternative:
 - The script uploads them to an internal Snowflake stage before processing.
 - The target reference tables already exist:
       STORES(STORE_ID, CLIENT_ID, STORE_NUMBER, REGION, ACTIVE_FLAG)
-      TECHNICIANS(TECHNICIAN_ID, TECHNICIAN_NAME, HOME_REGION, ACTIVE_FLAG)
+      TECHNICIANS(TECHNICIAN_ID, TECHNICIAN_NAME, HOME_REGION, ACTIVE_FLAG
 - The event/audit tables from the Flyway migrations already exist.
 
 This approach uses Snowflake/Snowpark for the transformation work. The
