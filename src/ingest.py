@@ -291,6 +291,7 @@ def load_to_snowflake(events: list[Event], rejects: list[Reject], checksum: str)
                 SOURCE_ROW_NUMBER NUMBER,
                 PAYLOAD_HASH STRING,
                 RAW_PAYLOAD_STRING STRING,
+                RAW_PAYLOAD VARIANT,
                 RUN_ID STRING
             )
             """
@@ -337,6 +338,15 @@ def load_to_snowflake(events: list[Event], rejects: list[Reject], checksum: str)
                 event_rows,
             )
 
+        # Parse JSON in a separate statement. Snowflake MERGE VALUES does not
+        # reliably accept PARSE_JSON(...) as an inline VALUES expression.
+        cur.execute(
+            """
+            UPDATE STAGE_WORK_ORDER_EVENTS
+            SET RAW_PAYLOAD = PARSE_JSON(RAW_PAYLOAD_STRING)
+            """
+        )
+
         cur.execute(
             """
             MERGE INTO WORK_ORDER_EVENTS AS target
@@ -365,7 +375,7 @@ def load_to_snowflake(events: list[Event], rejects: list[Reject], checksum: str)
                 SOURCE_FILE = source.SOURCE_FILE,
                 SOURCE_ROW_NUMBER = source.SOURCE_ROW_NUMBER,
                 PAYLOAD_HASH = source.PAYLOAD_HASH,
-                RAW_PAYLOAD = PARSE_JSON(source.RAW_PAYLOAD_STRING),
+                RAW_PAYLOAD = source.RAW_PAYLOAD,
                 LAST_SEEN_AT = CURRENT_TIMESTAMP()
 
             WHEN NOT MATCHED THEN INSERT (
@@ -382,7 +392,7 @@ def load_to_snowflake(events: list[Event], rejects: list[Reject], checksum: str)
                 source.STORE_ID, source.REGION, source.LABOR_MINUTES,
                 source.SOURCE_SYSTEM, source.SOURCE_FILE,
                 source.SOURCE_ROW_NUMBER, source.PAYLOAD_HASH,
-                PARSE_JSON(source.RAW_PAYLOAD_STRING),
+                source.RAW_PAYLOAD,
                 CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP()
             )
             """
