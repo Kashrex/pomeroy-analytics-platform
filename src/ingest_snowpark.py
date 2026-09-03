@@ -235,6 +235,7 @@ def process_events(session: Session, stage: str, run_id: str) -> dict:
     accepted_df = cached_df.filter(col("REJECT_REASON").is_null())
 
     # Write Rejects
+    # Write Rejects explicitly mapping the 5 columns to trigger the Defaults on the remaining 2
     rejects_to_write = rejected_df.select(
         lit(run_id).alias("RUN_ID"),
         col("SOURCE_FILE"),
@@ -242,8 +243,20 @@ def process_events(session: Session, stage: str, run_id: str) -> dict:
         col("REJECT_REASON").alias("REASON"),
         col("RAW_PAYLOAD_STRING").alias("RAW_PAYLOAD")
     )
-    rejects_to_write.write.mode("append").save_as_table("REJECTED_RECORDS")
+    
     reject_count = rejects_to_write.count()
+    if reject_count > 0:
+        rejects_to_write.create_or_replace_temp_view("STG_REJECTS")
+        session.sql(
+            """
+            INSERT INTO REJECTED_RECORDS (
+                RUN_ID, SOURCE_FILE, SOURCE_ROW_NUMBER, REASON, RAW_PAYLOAD
+            )
+            SELECT 
+                RUN_ID, SOURCE_FILE, SOURCE_ROW_NUMBER, REASON, RAW_PAYLOAD
+            FROM STG_REJECTS
+            """
+        ).collect()
 
     # 7. Deduplicate Accepted
     accepted_df = accepted_df.with_column("EVENT_TIMESTAMP_UTC", to_timestamp_tz(col("EVENT_TIMESTAMP_RAW")))
