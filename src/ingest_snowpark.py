@@ -49,6 +49,12 @@ from snowflake.snowpark.functions import (
     upper,
     when,
 )
+from snowflake.snowpark.types import (
+    IntegerType,
+    StringType,
+    StructField,
+    StructType,
+)
 from snowflake.snowpark.window import Window
 
 
@@ -62,6 +68,29 @@ VALID_EVENT_TYPES = (
 )
 
 VALID_PRIORITIES = ("P1", "P2", "P3", "P4")
+
+# Explicit Snowpark schemas for the reference CSV files. DataFrameReader.schema()
+# requires a StructType (built from StructField objects), not a plain list of
+# column-name strings -- passing a list causes:
+#   AttributeError: 'list' object has no attribute 'fields'
+STORES_SCHEMA = StructType(
+    [
+        StructField("STORE_ID", StringType()),
+        StructField("CLIENT_ID", StringType()),
+        StructField("STORE_NUMBER", StringType()),
+        StructField("REGION", StringType()),
+        StructField("ACTIVE_FLAG", StringType()),
+    ]
+)
+
+TECHNICIANS_SCHEMA = StructType(
+    [
+        StructField("TECHNICIAN_ID", StringType()),
+        StructField("TECHNICIAN_NAME", StringType()),
+        StructField("HOME_REGION", StringType()),
+        StructField("ACTIVE_FLAG", StringType()),
+    ]
+)
 
 
 def create_session() -> Session:
@@ -155,29 +184,14 @@ def load_reference_tables(session: Session, stage: str) -> None:
     stores = (
         session.read.option("FIELD_DELIMITER", ",")
         .option("SKIP_HEADER", 1)
-        .schema(
-            [
-                "STORE_ID",
-                "CLIENT_ID",
-                "STORE_NUMBER",
-                "REGION",
-                "ACTIVE_FLAG",
-            ]
-        )
+        .schema(STORES_SCHEMA)
         .csv(f"@{stage}/reference/stores.csv.gz")
     )
 
     technicians = (
         session.read.option("FIELD_DELIMITER", ",")
         .option("SKIP_HEADER", 1)
-        .schema(
-            [
-                "TECHNICIAN_ID",
-                "TECHNICIAN_NAME",
-                "HOME_REGION",
-                "ACTIVE_FLAG",
-            ]
-        )
+        .schema(TECHNICIANS_SCHEMA)
         .csv(f"@{stage}/reference/technicians.csv.gz")
     )
 
