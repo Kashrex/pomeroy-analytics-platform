@@ -2,14 +2,10 @@ name: Deploy Snowflake and ingest
 
 on:
   workflow_dispatch:
-    inputs:
-      source_path:
-        description: 'Path or mounted location containing the supplied source files'
-        required: true
 
 jobs:
   migrate-and-ingest:
-    runs-on: self-hosted # Deliberate: source files and Snowflake network access remain private.
+    runs-on: ubuntu-latest
     environment: production
     permissions:
       contents: read
@@ -55,7 +51,7 @@ jobs:
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
       - name: Ingest source batch after schema deployment
-        run: python -m src.ingest --source-dir "${{ inputs.source_path }}"
+        run: python -m src.ingest --source-dir data/source
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}

@@ -7,8 +7,8 @@ An assessment-sized Snowflake medallion implementation for work-order events. It
 1. Create a virtual environment and run `pip install -r requirements.txt`.
 2. Apply the migration scripts with Flyway from the repository root: `flyway migrate -url="$SNOWFLAKE_JDBC_URL" -user="$SNOWFLAKE_USER" -password="$SNOWFLAKE_PASSWORD"`.
 3. Set `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_PASSWORD`, and `SNOWFLAKE_DATABASE` (optionally warehouse, role, and schema).
-4. Validate without loading: `python -m src.ingest --source-dir <source-files-directory> --dry-run`.
-5. Load: `python -m src.ingest --source-dir <source-files-directory>`.
+4. Validate without loading: `python -m src.ingest --source-dir data/source --dry-run`.
+5. Load: `python -m src.ingest --source-dir data/source`.
 
 Confirm access without changing data by running `python -m src.preflight`. The expected schema is `WORK`.
 
@@ -41,4 +41,4 @@ See [architecture.md](architecture.md) for the production design.
 
 ## GitHub deployment prerequisites
 
-The workflow runs on a self-hosted runner because it must access the source-file path provided at manual dispatch. The runner needs outbound HTTPS access to GitHub, Snowflake, and the Flyway download endpoint. Add the Snowflake secrets listed in the deployment documentation to the `production` GitHub environment. The workflow installs Python dependencies and Flyway, checks the Snowflake connection with `flyway info`, applies migrations, and only then starts ingestion.
+The supplied source files are versioned under `data/source`, so the workflow runs on a GitHub-hosted Ubuntu runner and needs no manual path input. The runner needs outbound HTTPS access to GitHub, Snowflake, and the Flyway download endpoint. Add the Snowflake secrets listed in the deployment documentation to the `production` GitHub environment. The workflow installs Python dependencies and Flyway, checks the Snowflake connection with `flyway info`, applies migrations, and only then starts ingestion.
